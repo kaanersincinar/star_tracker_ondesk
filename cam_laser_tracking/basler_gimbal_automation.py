@@ -4,6 +4,9 @@ import numpy as np
 import math
 import time
 import serial
+import config as gimbalConfig
+
+from port_listener import list_serial_ports
 
 # --- Kamera ve optik parametreler ---
 PIXEL_SIZE_UM = 2.5
@@ -15,8 +18,6 @@ DISPLAY_W = 512
 DISPLAY_H = 512
 
 # --- Gimbal / seri port parametreleri ---
-PORT = "/dev/ttyUSB0"   # kendi portun
-BAUD = 250000           # Marlin baud
 FEEDRATE = 3000         # G1 F hızı (mm/dk ya da senin birimin)
 SER_ENABLED = True      # Seri port açılmazsa sadece takip yapılır
 
@@ -32,10 +33,10 @@ EL_DEADBAND_DEG = 0.02
 MAX_STEP_MM = 0.5
 
 # Görüntü boyutu (ROI) – Pylon'daki değerler
-ROI_W = 2748
-ROI_H = 2800
-ROI_OFFX = 828
-ROI_OFFY = 230
+ROI_W = 4508
+ROI_H = 4096
+ROI_OFFX = 0
+ROI_OFFY = 0
 
 # --- Yazılımsal endstop limitleri (mm) ---
 # X ekseni: toplam 20 cm → -10 cm .. +10 cm
@@ -49,7 +50,9 @@ Y_MAX_MM =  40.0    # +4 cm
 current_x_mm = 0.0
 current_y_mm = 0.0
 
-ser = None
+SER_MKS_PORT = None
+SER_ARD1_PORT = None
+SER_ARD2_PORT = None
 
 
 # -------------------------------------------------
@@ -319,8 +322,8 @@ def init_serial():
         return
 
     try:
-        ser = serial.Serial(PORT, BAUD, timeout=0.01)
-        print(f"Seri port açıldı: {PORT} @ {BAUD}")
+        ser = serial.Serial(SER_MKS_PORT, gimbalConfig.BAUD_MKS, timeout=0.01)
+        print(f"Seri port açıldı: {SER_MKS_PORT} @ {gimbalConfig.BAUD_MKS}")
         time.sleep(2.0)  # Marlin reset için
         send_gcode("G91")  # Göreceli mod
     except Exception as e:
@@ -622,5 +625,18 @@ def track_star():
                 pass
 
 
-if __name__ == "__main__":
+def main ():
+    global SER_MKS_PORT
+    global SER_ARD1_PORT
+    global SER_ARD2_PORT
+
+    mks_port, ard_ports = list_serial_ports()
+    SER_MKS_PORT = mks_port
+    SER_ARD1_PORT = ard_ports[0]
+    SER_ARD2_PORT = ard_ports[1]
+
     track_star()
+
+
+if __name__ == "__main__":
+    main()
