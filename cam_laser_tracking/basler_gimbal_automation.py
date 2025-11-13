@@ -8,9 +8,30 @@ import serial.tools.list_ports
 import config as cfg
 import threading
 
-
 from port_listener import list_serial_ports
 from magnetic_reader import arduino_worker
+
+# --- Lazer tespiti için HSV aralığı (kırmızı lazer varsayıyorum) ---
+# LASER_RED1_LOWER = (0,   120, 200)
+# LASER_RED1_UPPER = (10,  255, 255)
+# LASER_RED2_LOWER = (170, 120, 200)
+# LASER_RED2_UPPER = (180, 255, 255)
+
+# --- Mavi lazer HSV aralığı ---
+LASER_BLUE_LOWER = (90,  80, 120)
+LASER_BLUE_UPPER = (140, 255, 255)
+
+
+MIN_AREA_LASER = 5  # lazer noktası için minimum alan (px^2) - gerekirse küçült
+
+# --- Lazer gimbali için kontrol gain'leri ---
+K_AZ_MM_PER_DEG_LASER = 0.1   # senin mekaniğine göre tune et
+K_EL_MM_PER_DEG_LASER = 0.1
+
+LASER_DEADBAND_DEG = 0.02     # çok küçük hataları ignore et
+MAX_STEP_MM_LASER   = 2.0     # tek komutta max adım (mm)
+
+
 # --- Kamera ve optik parametreler ---
 PIXEL_SIZE_UM = 2.5
 PIXEL_SIZE_MM = PIXEL_SIZE_UM / 1000.0
@@ -80,7 +101,6 @@ def detect_bright_circle_center_mono(img):
 
     return (cx, cy), radius, maxVal
 
-
 def detect_green_circle_center(img):
     """
     Renkli görüntüde yeşil dairenin merkezini bul.
@@ -131,6 +151,33 @@ def detect_green_circle_center(img):
 
     return (cx, cy), radius, maxVal
 
+def detect_laser_circle_center(color_img):
+    """
+    Mavi lazer spotunu HSV uzayında bulur.
+    Çıkış: (center(x,y), radius, maxVal)
+    """
+    hsv = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, LASER_BLUE_LOWER, LASER_BLUE_UPPER)
+    mask = cv2.medianBlur(mask, 5)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise RuntimeError("Mavi lazer spotu bulunamadı (kontur yok).")
+
+    c = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(c)
+    if area < MIN_AREA_LASER:
+        raise RuntimeError(f"Lazer spot alanı çok küçük: {area:.1f}")
+
+    (x, y), radius = cv2.minEnclosingCircle(c)
+    x, y = int(x), int(y)
+    radius = int(radius)
+
+    laser_mask_roi = mask[max(0, y-5):y+5, max(0, x-5):x+5]
+    maxVal = float(laser_mask_roi.max()) if laser_mask_roi.size > 0 else 0.0
+    print("LASER HSV center pixel:", hsv[y, x])
+
+    return (x, y), radius, maxVal
 
 def set_exposure_basler(cam, exp_us):
     """Basler kamerada manuel exposure ayarla (µs)."""
@@ -157,7 +204,6 @@ def set_exposure_basler(cam, exp_us):
     print("Exposure set to:", val, "us")
     return val
 
-
 def snap_to_inc(val, inc):
     """Değerleri node'un increment'ine oturt."""
     try:
@@ -165,7 +211,6 @@ def snap_to_inc(val, inc):
     except Exception:
         inc = 1
     return val if inc <= 1 else (val // inc) * inc
-
 
 def set_safe(node, value):
     """GenICam node'a güvenli yaz (min/max clamp)."""
@@ -177,7 +222,6 @@ def set_safe(node, value):
     except Exception:
         pass
     node.SetValue(value)
-
 
 def set_roi_basler(cam, roi_w, roi_h, offx, offy):
     """Basler kamerada ROI ayarı (Width, Height, OffsetX, OffsetY)."""
@@ -229,7 +273,6 @@ def set_roi_basler(cam, roi_w, roi_h, offx, offy):
 
     except Exception as e:
         print("ROI ayarlanamadı:", e)
-
 
 def open_basler_camera():
     """
@@ -321,6 +364,18 @@ def send_gcode(cmd: str):
     except Exception as e:
         print("G-code gönderilemedi:", e)
 
+def move_laser_gimbal_relative(dx_mm, dy_mm):
+    """
+    Lazer gimbalını relatif modda hareket ettirir.
+    dx_mm, dy_mm = X/Y ekseninde gidilecek mesafe (mm).
+    """
+
+    if abs(dx_mm) < 1e-6 and abs(dy_mm) < 1e-6:
+        return
+
+    # G91 relatif, G90 absolute
+    cmd = f"G1 Z{dx_mm:.3f} A{dy_mm:.3f} F{cfg.FEEDRATE}\n"
+    send_gcode(cmd)
 
 def send_to_gimbal(az_deg, el_deg):
     """
@@ -498,13 +553,13 @@ def track_star():
             h, w = color_img.shape[:2]
             center = (w // 2, h // 2)
 
-            # --- Nesne tespiti ---
+            # --- NESNE TESPİTİ: YEŞİL HEDEF ---
             try:
                 if detection_mode == "green":
-                    circle_center, radius, maxVal = detect_green_circle_center(color_img)
+                    circle_center, radius_star, maxVal = detect_green_circle_center(color_img)
                 else:
                     # mono parlak daire
-                    circle_center, radius, maxVal = detect_bright_circle_center_mono(color_img)
+                    circle_center, radius_star, maxVal = detect_bright_circle_center_mono(color_img)
             except Exception as e:
                 print(f"Nesne bulunamadı ({detection_mode}):", e)
                 annotated = color_img.copy()
@@ -530,22 +585,63 @@ def track_star():
 
             mode_icon = "🟢" if detection_mode == "green" else "⚪"
             print(
-                f"{mode_icon} mode={detection_mode} center={circle_center}  "
+                f"{mode_icon} STAR mode={detection_mode} center={circle_center}  "
                 f"Δx={dx:4d} Δy={dy:4d}  "
                 f"az={az_deg:7.3f}° el={el_deg:7.3f}°  I={maxVal:.1f}"
             )
 
-            # --- Gimbale komut ---
+            # --- KAMERA GİMBAL KOMUTU (AYNI KALDI) ---
             send_to_gimbal(az_deg, el_deg)
 
-            # --- Overlay ---
+            # --- OVERLAY BAŞLANGIÇ ---
             annotated = color_img.copy()
             cv2.drawMarker(
                 annotated, center, (0, 255, 0),
                 cv2.MARKER_CROSS, 20, 2
             )
-            cv2.circle(annotated, (cx, cy), radius, (255, 0, 0), 2)
+            cv2.circle(annotated, (cx, cy), radius_star, (255, 0, 0), 2)
             cv2.circle(annotated, (cx, cy), 3, (0, 0, 255), -1)
+
+            # ================= LAZER TAKİP BLOĞU =================
+            try:
+                laser_center, radius_laser, laser_I = detect_laser_circle_center(color_img)
+                lx, ly = laser_center
+
+                # Lazer → YILDIZ hizalama: lazer yeşil noktaya kilitlensin
+                dx_laser_px = cx - lx          # hedef: yeşil nokta
+                dy_laser_px = ly - cy          # ekran koordinatına göre
+
+                az_laser_deg, el_laser_deg = pixels_to_angle(dx_laser_px, dy_laser_px)
+
+                # Deadband
+                if abs(az_laser_deg) < LASER_DEADBAND_DEG:
+                    az_laser_deg = 0.0
+                if abs(el_laser_deg) < LASER_DEADBAND_DEG:
+                    el_laser_deg = 0.0
+
+                # BURAYA KENDİ LAZER GİMBAL KOMUTUNU BAĞLA
+                # Örn: send_to_laser_gimbal(az_laser_deg, el_laser_deg)
+                try:
+                    move_laser_gimbal_relative(az_laser_deg, el_laser_deg)
+                except NameError:
+                    # Henüz tanımlamadıysan sessizce geç, sadece log yaz
+                    pass
+
+                print(
+                    f"🔴 LASER center={laser_center} "
+                    f"Δx_laser={dx_laser_px:4d} Δy_laser={dy_laser_px:4d} "
+                    f"az_L={az_laser_deg:7.3f}° el_L={el_laser_deg:7.3f}° I_L={laser_I:.1f}"
+                )
+
+                # Overlay: lazeri de çiz
+                cv2.circle(annotated, (lx, ly), radius_laser, (0, 255, 255), 2)
+                cv2.circle(annotated, (lx, ly), 3, (0, 255, 255), -1)
+
+            except Exception as e:
+                # Lazer görünmüyorsa veya tespit edilemediyse sadece logla, takip döngüsü bozulmasın
+                # print(f"Lazer bulunamadı: {e}")
+                pass
+            # =====================================================
 
             if current_exp is None:
                 exp_text = "Exp: N/A"
@@ -614,6 +710,7 @@ def main ():
         t.start()
         threads.append(t)
     track_star()
+    
 
 
 if __name__ == "__main__":

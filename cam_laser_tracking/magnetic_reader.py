@@ -2,9 +2,10 @@ import time
 import threading
 import serial
 import serial.tools.list_ports
+import re
 import config as cfg
 from port_listener import find_mks_port,list_candidate_ports
-# ----------------------------------------------------------
+#-----------------------------------------------------------
 #  ARDUINO FRAME PARSE
 # ----------------------------------------------------------
 
@@ -23,7 +24,6 @@ def parse_frame(frame: bytes):
     y  = int.from_bytes(frame[7:11],  "big", signed=True)
     az = int.from_bytes(frame[11:15], "big", signed=True)
     return node_id, x, y, az
-
 
 def arduino_worker(port: str):
     try:

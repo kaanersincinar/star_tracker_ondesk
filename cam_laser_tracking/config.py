@@ -12,7 +12,7 @@ DISPLAY_W = 512
 DISPLAY_H = 512
 
 # --- Gimbal hız parametresi ---
-FEEDRATE = 450         # G1 F hızı (mm/dk)
+FEEDRATE = 2500         # G1 F hızı (mm/dk)
 
 
 # Açısal hata → mm (veya kartının beklediği birim) çeviren gain
@@ -24,7 +24,7 @@ AZ_DEADBAND_DEG = 0.02
 EL_DEADBAND_DEG = 0.02
 
 # Tek seferde gönderilecek maksimum adım (mm)
-MAX_STEP_MM = 1.5
+MAX_STEP_MM = 0.5
 
 # Görüntü boyutu (ROI) – Pylon'daki değerler
 ROI_W = 4508
@@ -39,6 +39,8 @@ X_MIN_MM = -100.0   # -10 cm
 X_MAX_MM =  100.0   # +10 cm
 Y_MIN_MM = -40.0    # -4 cm
 Y_MAX_MM =  40.0    # +4 cm
+
+
 
 
 
