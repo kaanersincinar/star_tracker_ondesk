@@ -4,63 +4,126 @@ import numpy as np
 import math
 import time
 import serial
-import random  # <-- RANDOM TARGET SEÇİMİ İÇİN
+import random
 
-# --- Kamera ve optik parametreler ---
+# ============================================================
+#  MKS / TEK SERİ PORT AYARLARI
+# ============================================================
+MKS_PORT = "/dev/ttyUSB4"   # TODO: MKS kartının portu
+MKS_BAUD = 250000
+FEEDRATE = 450              # G1 F değeri
+
+# Kamera gimbali eksen isimleri (MKS firmware'ine göre)
+CAM_AXIS_X = "X"
+CAM_AXIS_Y = "Y"
+
+# Lazer gimbali eksen isimleri
+LAS_AXIS_X = "Z"            # Örn: Z ekseni
+LAS_AXIS_Y = "A"            # Örn: E ekseni
+
+# ------------------------------------------------------------
+#  KAMERA GİMBALI İÇİN mm/deg GAIN
+# ------------------------------------------------------------
+K_AZ_MM_PER_DEG = 0.1   # Kamera azimuth (X) için 1° -> kaç mm
+K_EL_MM_PER_DEG = 0.1   # Kamera elevation (Y) için 1° -> kaç mm
+
+# ------------------------------------------------------------
+#  LAZER GİMBALI İÇİN mm/deg GAIN
+# ------------------------------------------------------------
+K_LAZ_AZ_MM_PER_DEG = 0.1   # Lazer azimuth (Z)
+K_LAZ_EL_MM_PER_DEG = 0.1   # Lazer elevation (E)
+
+# Deadband ve max adımlar
+AZ_DEADBAND_DEG = 0.02
+EL_DEADBAND_DEG = 0.02
+CAM_MAX_STEP_MM = 0.5
+LASER_MAX_STEP_MM = 0.5
+
+# Kamera gimbali için yazılımsal limitler
+X_MIN_MM = -100.0
+X_MAX_MM =  100.0
+Y_MIN_MM = -40.0
+Y_MAX_MM =  40.0
+
+# Kamera gimbali pozisyonu ve mutlak açıları
+current_x_mm    = 0.0
+current_y_mm    = 0.0
+cam_az_abs_deg  = 0.0
+cam_el_abs_deg  = 0.0
+
+# Lazer gimbali pozisyonu ve mutlak açıları
+laser_x_mm      = 0.0
+laser_y_mm      = 0.0
+laser_az_abs_deg = 0.0
+laser_el_abs_deg = 0.0
+
+# Ortak seri port
+ser = None
+
+# ------------------------------------------------------------
+#  KAMERA–LAZER GEOMETRİSİ (YAN YANA, AYNI YÜKSEKLİKTE)
+# ------------------------------------------------------------
+# Kamera merkezini (0,0,0) alıyoruz, lazer merkezini (BASELINE_X_MM, 0, 0).
+BASELINE_X_MM        = 300.0   # TODO: kamera–lazer yatay mesafe (mm)
+DIST_TO_HOLOGRAM_MM  = 540.0   # TODO: gimbal pivotu -> hologram düzlemi (mm)
+
+# ------------------------------------------------------------
+#  KAMERA / OPTİK PARAMETRELER
+# ------------------------------------------------------------
 PIXEL_SIZE_UM = 2.5
 PIXEL_SIZE_MM = PIXEL_SIZE_UM / 1000.0
 FOCAL_LENGTH_MM = 12.39
 
-# Ekranda görmek istediğin pencere boyutu
 DISPLAY_W = 512
 DISPLAY_H = 512
 
-# --- Gimbal / seri port parametreleri ---
-PORT = "/dev/ttyUSB4"   # kendi portun
-BAUD = 250000           # Marlin baud
-FEEDRATE = 450         # G1 F hızı (mm/dk ya da senin birimin)
-SER_ENABLED = True      # Seri port açılmazsa sadece takip yapılır
-
-# Açısal hata → mm (veya kartının beklediği birim) çeviren gain
-K_AZ_MM_PER_DEG = 0.1   # azimut ekseni için
-K_EL_MM_PER_DEG = 0.1   # elevasyon ekseni için
-
-# Çok küçük hatalarda komut göndermemek için deadband
-AZ_DEADBAND_DEG = 0.02
-EL_DEADBAND_DEG = 0.02
-
-# Tek seferde gönderilecek maksimum adım (mm)
-MAX_STEP_MM = 0.5
-
-# Görüntü boyutu (ROI) – Pylon'daki değerler
+# Görüntü ROI
 ROI_W = 2748
 ROI_H = 2800
 ROI_OFFX = 828
 ROI_OFFY = 230
 
-# --- Yazılımsal endstop limitleri (mm) ---
-# X ekseni: toplam 20 cm → -10 cm .. +10 cm
-# Y ekseni: toplam 8  cm → -4  cm .. +4  cm
-X_MIN_MM = -100.0   # -10 cm
-X_MAX_MM =  100.0   # +10 cm
-Y_MIN_MM = -40.0    # -4 cm
-Y_MAX_MM =  40.0    # +4 cm
+# Rastgele hedef ayarları
+HOLD_TIME_SEC = 5.0
+CENTER_TOL_PX = 3
+TARGET_LOST_MAX_DIST_PX = 60
 
-# Script başladığında kabul edilen referans konum (mm)
-current_x_mm = 0.0
-current_y_mm = 0.0
+# ============================================================
+#  SERİ PORT / MKS
+# ============================================================
+def init_mks_serial():
+    global ser
+    try:
+        ser = serial.Serial(MKS_PORT, MKS_BAUD, timeout=0.01)
+        print(f"✅ MKS seri port açıldı: {MKS_PORT} @ {MKS_BAUD}")
+        time.sleep(2.0)
+        ser.write(b"G91\n")   # Tüm eksenler göreceli mod
+    except Exception as e:
+        print("❌ MKS seri port AÇILAMADI, DRY-RUN mod:", e)
+        ser = None
 
-ser = None
 
-# --- RASTGELE HEDEF AYARLARI ---
-HOLD_TIME_SEC = 5.0          # Hedefte kalma süresi
-CENTER_TOL_PX = 3            # "Merkezde say" toleransı (piksel)
-TARGET_LOST_MAX_DIST_PX = 60 # Hedeften kopma mesafesi
+def send_mks_gcode(cmd: str):
+    global ser
+    if ser is None:
+        print("(DRY-RUN)", cmd)
+        return
+    try:
+        line = (cmd.strip() + "\n").encode()
+        ser.write(line)
+        print("→ GCODE:", cmd)
+        time.sleep(0.001)
+        while ser.in_waiting:
+            resp = ser.readline().decode(errors="ignore").strip()
+            if resp:
+                print("<", resp)
+    except Exception as e:
+        print("G-code gönderilemedi:", e)
 
-# -------------------------------------------------
-#  Yardımcı fonksiyonlar
-# -------------------------------------------------
 
+# ============================================================
+#  GÖRÜNTÜDEN AÇIYA GEÇİŞ
+# ============================================================
 def pixels_to_angle(delta_x, delta_y):
     """Piksel ofsetini (dx, dy) açıya çevir (derece) → (azimuth, elevation)."""
     dx_mm = delta_x * PIXEL_SIZE_MM
@@ -70,98 +133,16 @@ def pixels_to_angle(delta_x, delta_y):
     return theta_x, theta_y
 
 
-def detect_bright_circle_center_mono(img):
-    """
-    Eski tek hedef fonksiyonun – ARTIK RANDOM MODE İÇİN KULLANMIYORUZ ama dursun.
-    """
-    if len(img.shape) == 3:
-        gray = img[:, :, 0]
-    else:
-        gray = img
-
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(
-        blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-
-    contours, _ = cv2.findContours(
-        thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    if not contours:
-        raise ValueError("Hiç kontur bulunamadı (parlak cisim algılanamadı).")
-
-    big_cnt = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(big_cnt)
-    if area < 20:
-        raise ValueError("Algılanan kontur çok küçük (muhtemelen gürültü).")
-
-    M = cv2.moments(big_cnt)
-    if M["m00"] == 0:
-        raise ValueError("Moment hatası (m00=0).")
-
-    cx = int(M["m10"] / M["m00"])
-    cy = int(M["m01"] / M["m00"])
-
-    radius = int(math.sqrt(area / math.pi))
-    maxVal = float(gray[cy, cx])
-
-    return (cx, cy), radius, maxVal
-
-
-def detect_green_circle_center(img):
-    """
-    Eski tek hedef fonksiyonun – ARTIK RANDOM MODE İÇİN KULLANMIYORUZ ama dursun.
-    """
-    if len(img.shape) == 2 or img.shape[2] == 1:
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    else:
-        img_bgr = img
-
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-
-    lower_green = np.array([35, 60, 40], dtype=np.uint8)
-    upper_green = np.array([85, 255, 255], dtype=np.uint8)
-
-    mask = cv2.inRange(hsv, lower_green, upper_green)
-
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    contours, _ = cv2.findContours(
-        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    if not contours:
-        raise ValueError("Yeşil bölge bulunamadı (kontur yok).")
-
-    big_cnt = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(big_cnt)
-    if area < 50:
-        raise ValueError("Algılanan yeşil kontur çok küçük (muhtemelen gürültü).")
-
-    M = cv2.moments(big_cnt)
-    if M["m00"] == 0:
-        raise ValueError("Moment hatası (m00=0).")
-
-    cx = int(M["m10"] / M["m00"])
-    cy = int(M["m01"] / M["m00"])
-
-    radius = int(math.sqrt(area / math.pi))
-    maxVal = float(mask[cy, cx])
-
-    return (cx, cy), radius, maxVal
-
-
+# ============================================================
+#  BASLER / PYLON YARDIMCI FONKSİYONLAR
+# ============================================================
 def set_exposure_basler(cam, exp_us):
-    """Basler kamerada manuel exposure ayarla (µs)."""
     try:
         if cam.ExposureAuto.IsWritable():
             cam.ExposureAuto.SetValue("Off")
             print("ExposureAuto → Off")
     except Exception as e:
-        print("ExposureAuto kapatılamadı (önemli değil olabilir):", e)
+        print("ExposureAuto kapatılamadı:", e)
 
     try:
         node = cam.ExposureTime
@@ -181,7 +162,6 @@ def set_exposure_basler(cam, exp_us):
 
 
 def snap_to_inc(val, inc):
-    """Değerleri node'un increment'ine oturt."""
     try:
         inc = int(inc)
     except Exception:
@@ -190,7 +170,6 @@ def snap_to_inc(val, inc):
 
 
 def set_safe(node, value):
-    """GenICam node'a güvenli yaz (min/max clamp)."""
     try:
         vmin = node.GetMin()
         vmax = node.GetMax()
@@ -202,7 +181,6 @@ def set_safe(node, value):
 
 
 def set_roi_basler(cam, roi_w, roi_h, offx, offy):
-    """Basler kamerada ROI ayarı (Width, Height, OffsetX, OffsetY)."""
     try:
         try:
             set_safe(cam.OffsetX, 0)
@@ -217,17 +195,14 @@ def set_roi_basler(cam, roi_w, roi_h, offx, offy):
             w_inc = cam.Width.GetInc()
         except Exception:
             w_inc = 1
-
         try:
             h_inc = cam.Height.GetInc()
         except Exception:
             h_inc = 1
-
         try:
             ox_inc = cam.OffsetX.GetInc()
         except Exception:
             ox_inc = 1
-
         try:
             oy_inc = cam.OffsetY.GetInc()
         except Exception:
@@ -244,15 +219,11 @@ def set_roi_basler(cam, roi_w, roi_h, offx, offy):
         set_safe(cam.OffsetY, OY)
 
         print(f"ROI ayarlandı: Width={W}, Height={H}, OffsetX={OX}, OffsetY={OY}")
-
     except Exception as e:
         print("ROI ayarlanamadı:", e)
 
 
 def open_basler_camera():
-    """
-    İlk bulunan Basler GigE (tercihen) veya başka bir Basler kamerayı açar.
-    """
     tl_factory = pylon.TlFactory.GetInstance()
 
     gige_tl = None
@@ -262,7 +233,6 @@ def open_basler_camera():
             break
 
     devices = []
-
     if gige_tl is not None:
         try:
             devices = gige_tl.EnumerateAllDevices()
@@ -298,65 +268,30 @@ def open_basler_camera():
     return cam
 
 
-# -------------------------------------------------
-#  Seri port / gimbal fonksiyonları
-# -------------------------------------------------
-def init_serial():
-    """Marlin kart ile seri haberleşmeyi başlat."""
-    global ser
-    if not SER_ENABLED:
-        print("Seri port devre dışı (SER_ENABLED = False).")
-        ser = None
-        return
-
-    try:
-        ser = serial.Serial(PORT, BAUD, timeout=0.01)
-        print(f"Seri port açıldı: {PORT} @ {BAUD}")
-        time.sleep(2.0)  # Marlin reset için
-        send_gcode("G91")  # Göreceli mod
-    except Exception as e:
-        print("Seri port açılamadı, sadece görüntü takibi yapılacak:", e)
-        ser = None
-
-
-def send_gcode(cmd: str):
-    """Tek satır G-code gönder, cevapları non-blocking oku."""
-    global ser
-    if ser is None:
-        return
-    try:
-        line = (cmd.strip() + "\n").encode()
-        ser.write(line)
-        print("→ GCODE:", cmd)
-        time.sleep(0.001)
-        while ser.in_waiting:
-            resp = ser.readline().decode(errors="ignore").strip()
-            if resp:
-                print("<", resp)
-    except Exception as e:
-        print("G-code gönderilemedi:", e)
-
-
-def send_to_gimbal(az_deg, el_deg):
+# ============================================================
+#  KAMERA GİMBALINI (X/Y) SÜREN FONKSİYON
+# ============================================================
+def send_to_camera_gimbal(az_err_deg, el_err_deg):
     """
-    Kamera merkezine göre bulunan açısal hatayı
-    X/Y eksenlerine göre G-code hareketine çevirir.
+    Kameranın gördüğü hata açısını (az_err_deg, el_err_deg)
+    CAM_AXIS_X / CAM_AXIS_Y eksenleriyle kapatır.
+    Aynı zamanda kameranın mutlak açısını (cam_az_abs_deg / cam_el_abs_deg) günceller.
     """
     global ser, current_x_mm, current_y_mm
+    global cam_az_abs_deg, cam_el_abs_deg
 
     if ser is None:
-        print(f"(DRY-RUN) az={az_deg:.3f} el={el_deg:.3f}  "
-              f"[X={current_x_mm:.2f}mm Y={current_y_mm:.2f}mm]")
+        print(f"(DRY CAM) az={az_err_deg:.3f} el={el_err_deg:.3f}")
         return
 
-    if abs(az_deg) < AZ_DEADBAND_DEG and abs(el_deg) < EL_DEADBAND_DEG:
+    if abs(az_err_deg) < AZ_DEADBAND_DEG and abs(el_err_deg) < EL_DEADBAND_DEG:
         return
 
-    step_x = -K_AZ_MM_PER_DEG * az_deg
-    step_y =  K_EL_MM_PER_DEG * el_deg
+    step_x = - K_AZ_MM_PER_DEG * az_err_deg
+    step_y =   K_EL_MM_PER_DEG * el_err_deg
 
-    step_x = max(min(step_x, MAX_STEP_MM), -MAX_STEP_MM)
-    step_y = max(min(step_y, MAX_STEP_MM), -MAX_STEP_MM)
+    step_x = max(min(step_x, CAM_MAX_STEP_MM), -CAM_MAX_STEP_MM)
+    step_y = max(min(step_y, CAM_MAX_STEP_MM), -CAM_MAX_STEP_MM)
 
     target_x = current_x_mm + step_x
     target_y = current_y_mm + step_y
@@ -364,20 +299,20 @@ def send_to_gimbal(az_deg, el_deg):
     if target_x > X_MAX_MM:
         step_x = X_MAX_MM - current_x_mm
         target_x = X_MAX_MM
-        print("⚠ X yazılımsal endstop (üst limit)!")
+        print("⚠ CAM X yazılımsal endstop üst!")
     elif target_x < X_MIN_MM:
         step_x = X_MIN_MM - current_x_mm
         target_x = X_MIN_MM
-        print("⚠ X yazılımsal endstop (alt limit)!")
+        print("⚠ CAM X yazılımsal endstop alt!")
 
     if target_y > Y_MAX_MM:
         step_y = Y_MAX_MM - current_y_mm
         target_y = Y_MAX_MM
-        print("⚠ Y yazılımsal endstop (üst limit)!")
+        print("⚠ CAM Y yazılımsal endstop üst!")
     elif target_y < Y_MIN_MM:
         step_y = Y_MIN_MM - current_y_mm
         target_y = Y_MIN_MM
-        print("⚠ Y yazılımsal endstop (alt limit)!")
+        print("⚠ CAM Y yazılımsal endstop alt!")
 
     if abs(step_x) < 1e-3:
         step_x = 0.0
@@ -389,33 +324,121 @@ def send_to_gimbal(az_deg, el_deg):
 
     cmd_parts = []
     if step_x != 0.0:
-        cmd_parts.append(f"X{step_x:.3f}")
+        cmd_parts.append(f"{CAM_AXIS_X}{step_x:.3f}")
     if step_y != 0.0:
-        cmd_parts.append(f"Y{step_y:.3f}")
+        cmd_parts.append(f"{CAM_AXIS_Y}{step_y:.3f}")
     cmd = "G1 " + " ".join(cmd_parts) + f" F{FEEDRATE}"
-    send_gcode(cmd)
+    send_mks_gcode(cmd)
 
     current_x_mm += step_x
     current_y_mm += step_y
 
-    print(f"[POS] X={current_x_mm:.2f}mm  Y={current_y_mm:.2f}mm")
+    delta_az = - step_x / K_AZ_MM_PER_DEG
+    delta_el =   step_y / K_EL_MM_PER_DEG
+
+    cam_az_abs_deg += delta_az
+    cam_el_abs_deg += delta_el
+
+    print(f"[CAM POS] {CAM_AXIS_X}={current_x_mm:.2f}mm "
+          f"{CAM_AXIS_Y}={current_y_mm:.2f}mm "
+          f"(cam_az={cam_az_abs_deg:.3f}°, cam_el={cam_el_abs_deg:.3f}°)")
 
 
-# -------------------------------------------------
-#  Birden fazla noktayı bulmak için yeni fonksiyonlar
-# -------------------------------------------------
+# ============================================================
+#  KAMERA AÇISINDAN LAZER AÇISINA GEÇİŞ
+# ============================================================
+def camera_to_laser_angles(cam_az_deg, cam_el_deg):
+    """
+    Kamera ve lazer yan yana, aynı yükseklikte.
+    Kamera mutlak (az, el) açısını alır,
+    aynı hologram noktasını görebilmesi için lazere gereken (az, el) açıyı hesaplar.
+    """
+    cam_az_rad = math.radians(cam_az_deg)
+    cam_el_rad = math.radians(cam_el_deg)
+
+    # Kameradan bakınca hedefin hologram düzlemindeki konumu
+    X = DIST_TO_HOLOGRAM_MM * math.tan(cam_az_rad)
+    Y = DIST_TO_HOLOGRAM_MM * math.tan(cam_el_rad)
+
+    # Lazer koordinatında aynı nokta
+    X_L = X - BASELINE_X_MM         # lazer kameradan +B kadar sağda
+    Y_L = Y
+    Z_L = DIST_TO_HOLOGRAM_MM
+
+    # Lazer açısından azimut
+    az_l_rad = math.atan2(X_L, Z_L)
+    az_l_deg = math.degrees(az_l_rad)
+
+    # Elevation: aynı yükseklikteyse pratikte kamerayı kopyalıyoruz
+    el_l_deg = cam_el_deg
+
+    return az_l_deg, el_l_deg
+
+
+# ============================================================
+#  LAZER GİMBALINI (Z/E) HEDEF AÇIYA SÜRME
+# ============================================================
+def send_to_laser_target(target_az_deg, target_el_deg):
+    """
+    Lazerin mutlak açısını (laser_az_abs_deg/el_abs_deg) globalden okur,
+    hedef açıya göre farkı mm'ye çevirip LAS_AXIS_X / LAS_AXIS_Y eksenlerini sürer.
+    """
+    global laser_x_mm, laser_y_mm
+    global laser_az_abs_deg, laser_el_abs_deg
+
+    if ser is None:
+        print(f"(DRY LZR) tgt_az={target_az_deg:.3f} tgt_el={target_el_deg:.3f}")
+        return
+
+    d_az = target_az_deg - laser_az_abs_deg
+    d_el = target_el_deg - laser_el_abs_deg
+
+    if abs(d_az) < AZ_DEADBAND_DEG and abs(d_el) < EL_DEADBAND_DEG:
+        return
+
+    step_x = - K_LAZ_AZ_MM_PER_DEG * d_az
+    step_y =   K_LAZ_EL_MM_PER_DEG * d_el
+
+    step_x = max(min(step_x, LASER_MAX_STEP_MM), -LASER_MAX_STEP_MM)
+    step_y = max(min(step_y, LASER_MAX_STEP_MM), -LASER_MAX_STEP_MM)
+
+    if abs(step_x) < 1e-3:
+        step_x = 0.0
+    if abs(step_y) < 1e-3:
+        step_y = 0.0
+
+    if step_x == 0.0 and step_y == 0.0:
+        return
+
+    cmd_parts = []
+    if step_x != 0.0:
+        cmd_parts.append(f"{LAS_AXIS_X}{step_x:.3f}")
+    if step_y != 0.0:
+        cmd_parts.append(f"{LAS_AXIS_Y}{step_y:.3f}")
+    cmd = "G1 " + " ".join(cmd_parts) + f" F{FEEDRATE}"
+    send_mks_gcode(cmd)
+
+    laser_x_mm += step_x
+    laser_y_mm += step_y
+
+    delta_az = - step_x / K_LAZ_AZ_MM_PER_DEG
+    delta_el =   step_y / K_LAZ_EL_MM_PER_DEG
+
+    laser_az_abs_deg += delta_az
+    laser_el_abs_deg += delta_el
+
+    print(f"[LZR POS] {LAS_AXIS_X}={laser_x_mm:.2f}mm "
+          f"{LAS_AXIS_Y}={laser_y_mm:.2f}mm "
+          f"(laz_az={laser_az_abs_deg:.3f}°, laz_el={laser_el_abs_deg:.3f}°)")
+
+
+# ============================================================
+#  BİRDEN FAZLA NOKTA ALGILAMA (SENİN KODUNDAN)
+# ============================================================
 def find_white_points(img_bgr, min_area=30, thresh_val=220):
-    """
-    Renkten bağımsız, parlak (beyaza yakın) noktaları bul.
-    Dönen liste: (cx, cy, radius, area)
-    """
-    # BGR -> Gri
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-    # Parlaklık threshold: thresh_val'ı ortam ışığına göre oynat
     _, mask = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY)
 
-    # Gürültü temizliği
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
@@ -441,7 +464,6 @@ def find_white_points(img_bgr, min_area=30, thresh_val=220):
 
 
 def find_bright_points_mono(img, min_area=20):
-    """Mono görüntüde birden fazla parlak noktayı döndürür."""
     if len(img.shape) == 3:
         gray = img[:, :, 0]
     else:
@@ -471,22 +493,36 @@ def find_bright_points_mono(img, min_area=20):
     return points, gray
 
 
-# -------------------------------------------------
-#  Ana takip döngüsü – RANDOM HEDEF + 5 sn bekleme
-# -------------------------------------------------
+# ============================================================
+#  ANA TAKİP DÖNGÜSÜ (KAMERA + LAZER)
+# ============================================================
 def track_star():
+    global current_x_mm, current_y_mm, cam_az_abs_deg, cam_el_abs_deg
+    global laser_x_mm, laser_y_mm, laser_az_abs_deg, laser_el_abs_deg
+
+    # Başlangıçta tüm pozisyon/açıları sıfırla.
+    # Fiziksel olarak hem kamera hem lazeri hologramın ORTASINA baktırıp script'i öyle aç.
+    current_x_mm = 0.0
+    current_y_mm = 0.0
+    cam_az_abs_deg = 0.0
+    cam_el_abs_deg = 0.0
+
+    laser_x_mm = 0.0
+    laser_y_mm = 0.0
+    laser_az_abs_deg = 0.0
+    laser_el_abs_deg = 0.0
+
     cam = open_basler_camera()
-    init_serial()
+    init_mks_serial()
 
     pixel_format = "Unknown"
     is_bayer = False
-    is_true_mono = False
 
-    # RASTGELE HEDEF STATE
-    current_target = None      # (cx, cy, radius, area)
-    target_center_px = None    # (cx, cy)
-    target_centered_t = None   # merkezdeyken zaman
-    rng = random.Random()      # istersen rng.seed(...) ile deterministik yaparsın
+    # Rastgele hedef state
+    current_target = None
+    target_center_px = None
+    target_centered_t = None
+    rng = random.Random()
 
     try:
         try:
@@ -496,14 +532,12 @@ def track_star():
 
                 if "BGR8" in enum_entries:
                     cam.PixelFormat.SetValue("BGR8")
-                    print("🎨 PixelFormat → BGR8 (renkli)")
+                    print("🎨 PixelFormat → BGR8")
                 elif "RGB8Packed" in enum_entries:
                     cam.PixelFormat.SetValue("RGB8Packed")
-                    print("🎨 PixelFormat → RGB8Packed (renkli)")
+                    print("🎨 PixelFormat → RGB8Packed")
                 else:
                     print("⚠ BGR8/RGB8Packed yok, mevcut formatla devam ediliyor.")
-            else:
-                print("PixelFormat yazılabilir değil.")
         except Exception as e:
             print("PixelFormat ayarlanırken hata:", e)
 
@@ -512,8 +546,6 @@ def track_star():
             print("Aktif PixelFormat:", pixel_format)
             if pixel_format.startswith("Bayer"):
                 is_bayer = True
-            if pixel_format.startswith("Mono"):
-                is_true_mono = True
         except Exception as e:
             print("Aktif PixelFormat okunamadı:", e)
 
@@ -558,12 +590,11 @@ def track_star():
                     elif pixel_format == "BayerGR8":
                         color_img = cv2.cvtColor(image, cv2.COLOR_BAYER_GR2BGR)
                     elif pixel_format == "BayerGB8":
-                        color_img = cv2.cvtColor(image, cv2.COLOR_BAYER_GB2RGB)
+                        color_img = cv2.cvtColor(image, cv2.COLOR_BAYER_GB2BGR)
                     else:
                         color_img = cv2.cvtColor(image, cv2.COLOR_BAYER_RG2BGR)
                     detection_mode = "green"
                 else:
-                    print("⚠ Görüntü gerçek tek kanal (mono), renk tespiti olmayacak, parlak noktalara geçiyorum.")
                     gray_img = image
                     color_img = cv2.cvtColor(gray_img, cv2.COLOR_GRAY2BGR)
                     detection_mode = "mono"
@@ -574,7 +605,7 @@ def track_star():
             h, w = color_img.shape[:2]
             center = (w // 2, h // 2)
 
-            # --- Birden fazla nokta tespiti ---
+            # Birden fazla nokta tespiti
             if detection_mode == "green":
                 points, aux_img = find_white_points(color_img)
             else:
@@ -601,15 +632,13 @@ def track_star():
                     break
                 continue
 
-            # --- Hedef seçimi: random ---
+            # Hedef seçimi: random
             if current_target is None:
-                current_target = rng.choice(points)  # (cx, cy, radius, area)
+                current_target = rng.choice(points)
                 target_center_px = (current_target[0], current_target[1])
                 target_centered_t = None
                 print(f"🎯 Yeni rastgele hedef: {target_center_px}")
-
             else:
-                # Aynı hedefi tutmak için: mevcut noktalardan target_center_px'e en yakın olanı bul
                 tx_prev, ty_prev = target_center_px
                 best = None
                 best_d = None
@@ -620,7 +649,6 @@ def track_star():
                         best = (cx, cy, radius, area)
 
                 if best is None or best_d > TARGET_LOST_MAX_DIST_PX:
-                    # hedef kayboldu → yeni rastgele hedef
                     current_target = rng.choice(points)
                     target_center_px = (current_target[0], current_target[1])
                     target_centered_t = None
@@ -631,22 +659,30 @@ def track_star():
 
             cx, cy, radius, area = current_target
             dx = cx - center[0]
-            dy = center[1] - cy  # yukarı pozitif
+            dy = center[1] - cy
 
-            az_deg, el_deg = pixels_to_angle(dx, dy)
-
+            az_err_deg, el_err_deg = pixels_to_angle(dx, dy)
             err_pix = math.hypot(dx, dy)
             mode_icon = "🟢" if detection_mode == "green" else "⚪"
             print(
                 f"{mode_icon} mode={detection_mode} target={target_center_px}  "
                 f"Δx={dx:4d} Δy={dy:4d}  "
-                f"az={az_deg:7.3f}° el={el_deg:7.3f}°  |err|={err_pix:.1f}"
+                f"az_err={az_err_deg:7.3f}° el_err={el_err_deg:7.3f}°  |err|={err_pix:.1f}"
             )
 
-            # --- Gimbale komut (hedefe hizalama) ---
-            send_to_gimbal(az_deg, el_deg)
+            # 1) Kamera gimbali hedefi merkeze getirsin
+            send_to_camera_gimbal(az_err_deg, el_err_deg)
 
-            # --- 5 saniye merkezde kalma mantığı ---
+            # 2) Kameranın mutlak açısına göre lazer hedef açı hesapla
+            cam_az_deg = cam_az_abs_deg
+            cam_el_deg = cam_el_abs_deg
+
+            laz_az_tgt, laz_el_tgt = camera_to_laser_angles(cam_az_deg, cam_el_deg)
+
+            # 3) Lazeri bu hedef açılara sür
+            send_to_laser_target(laz_az_tgt, laz_el_tgt)
+
+            # 5 saniye merkezde kalma mantığı
             now = time.time()
             if err_pix <= CENTER_TOL_PX:
                 if target_centered_t is None:
@@ -659,36 +695,28 @@ def track_star():
                         target_center_px = None
                         target_centered_t = None
             else:
-                # merkezde değilse timer reset
                 target_centered_t = None
 
-            # --- Görsel overlay ---
+            # Görsel overlay
             annotated = color_img.copy()
             cv2.drawMarker(
                 annotated, center, (0, 255, 0),
                 cv2.MARKER_CROSS, 20, 2
             )
-
-            # Tüm noktaları çiz
             for (px, py, r, a) in points:
                 cv2.circle(annotated, (px, py), max(r, 3), (255, 0, 0), 1)
 
-            # Seçili hedefi farklı renkle vurgula
             cv2.circle(annotated, (cx, cy), max(radius, 5), (0, 0, 255), 2)
             cv2.circle(annotated, (cx, cy), 3, (0, 255, 255), -1)
 
-            if current_exp is None:
-                exp_text = "Exp: N/A"
-            else:
-                exp_text = f"Exp={current_exp:.0f} us"
-
+            exp_text = f"Exp={current_exp:.0f} us" if current_exp is not None else "Exp:N/A"
             cv2.putText(
                 annotated, f"dx={dx}px dy={dy}px",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                 0.7, (255, 255, 255), 2
             )
             cv2.putText(
-                annotated, f"az={az_deg:.2f} el={el_deg:.2f}",
+                annotated, f"az_err={az_err_deg:.2f} el_err={el_err_deg:.2f}",
                 (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
                 0.7, (0, 255, 255), 2
             )
@@ -723,7 +751,7 @@ def track_star():
         if ser is not None:
             try:
                 ser.close()
-                print("Seri port kapatıldı.")
+                print("MKS seri port kapatıldı.")
             except Exception:
                 pass
 

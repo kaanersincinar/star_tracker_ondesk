@@ -26,6 +26,7 @@ def list_candidate_ports():
 def is_mks_port(port: str) -> bool:
     print(f"[DEBUG] {port}: MKS testi basladi (baud={cfg.BAUD_MKS})")
     try:
+        #test amaçlı kapatıldı
         with serial.Serial(port=port, baudrate=cfg.BAUD_MKS, timeout=0.5) as ser:
             ser.reset_input_buffer()
             ser.reset_output_buffer()
