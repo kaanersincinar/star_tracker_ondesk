@@ -11,6 +11,8 @@ FOCAL_LENGTH_MM = 12.39
 DISPLAY_W = 512
 DISPLAY_H = 512
 
+#Pozlama süresi
+EXPOSURE = 22600.0
 # --- Gimbal hız parametresi ---
 FEEDRATE = 2500         # G1 F hızı (mm/dk)
 

@@ -856,7 +856,7 @@ def track_star(gui: TelemetryGUI):
             print("Aktif PixelFormat okunamadı:", e)
 
         set_roi_basler(cam, cfg.ROI_W, cfg.ROI_H, cfg.ROI_OFFX, cfg.ROI_OFFY)
-        current_exp = set_exposure_basler(cam, 22600.0)
+        current_exp = set_exposure_basler(cam,cfg.EXPOSURE)
 
         try:
             if cam.AcquisitionMode.IsWritable():
