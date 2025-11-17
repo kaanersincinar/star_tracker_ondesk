@@ -14,7 +14,7 @@ DISPLAY_H = 512
 #Pozlama süresi
 EXPOSURE = 22600.0
 # --- Gimbal hız parametresi ---
-FEEDRATE = 2500         # G1 F hızı (mm/dk)
+FEEDRATE = 250        # G1 F hızı (mm/dk)
 
 
 # Açısal hata → mm (veya kartının beklediği birim) çeviren gain
@@ -33,6 +33,7 @@ ROI_W = 4508
 ROI_H = 4096
 ROI_OFFX = 0
 ROI_OFFY = 0
+MINAREA= 50
 
 # --- Yazılımsal endstop limitleri (mm) ---
 # X ekseni: toplam 20 cm → -10 cm .. +10 cm

@@ -15,13 +15,14 @@ from PIL import Image, ImageTk
 from datetime import datetime
 
 from port_listener import list_serial_ports  # <-- eklendi
+import config as cfg
 
 # ======================================================
 #  CONFIG / CONSTANTS
 # ======================================================
 
 # --- Logo path for GUI header (update to your real path) ---
-LOGO_PATH = "logo.png"
+LOGO_PATH = "UZAY-Yatay-Beyaz.png"
 
 # --- Telemetry scale factors (counts → mm) ---
 X_MM_PER_COUNT = 1.0
@@ -644,7 +645,7 @@ def send_to_gimbal(az_deg, el_deg):
 #  MULTI-POINT RANDOM TARGET TRACKING
 # ======================================================
 
-def find_white_points(img_bgr, min_area=30, thresh_val=220):
+def find_white_points(img_bgr, min_area=cfg.MINAREA, thresh_val=220):
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
     _, mask = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY)
@@ -747,7 +748,7 @@ def track_star(stop_event):
         except Exception as e:
             print("Aktif PixelFormat okunamadı:", e)
 
-        set_roi_basler(cam, 2748, 2800, 828, 230)
+        #set_roi_basler(cam, 2748, 2800, 828, 230)
         current_exp = set_exposure_basler(cam, 22600.0)
 
         try:
