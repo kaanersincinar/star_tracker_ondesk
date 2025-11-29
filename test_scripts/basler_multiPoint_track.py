@@ -4,50 +4,58 @@ import numpy as np
 import math
 import time
 import serial
-import serial.tools.list_ports
-import config as cfg
-import threading
-
-from port_listener import list_serial_ports
-from magnetic_reader import arduino_worker
-
-# --- Lazer tespiti için HSV aralığı (kırmızı lazer varsayıyorum) ---
-# LASER_RED1_LOWER = (0,   120, 200)
-# LASER_RED1_UPPER = (10,  255, 255)
-# LASER_RED2_LOWER = (170, 120, 200)
-# LASER_RED2_UPPER = (180, 255, 255)
-
-# --- Mavi lazer HSV aralığı ---
-LASER_BLUE_LOWER = (90,  80, 120)
-LASER_BLUE_UPPER = (140, 255, 255)
-
-
-MIN_AREA_LASER = 5  # lazer noktası için minimum alan (px^2) - gerekirse küçült
-
-# --- Lazer gimbali için kontrol gain'leri ---
-K_AZ_MM_PER_DEG_LASER = 0.1   # senin mekaniğine göre tune et
-K_EL_MM_PER_DEG_LASER = 0.1
-
-LASER_DEADBAND_DEG = 0.02     # çok küçük hataları ignore et
-MAX_STEP_MM_LASER   = 2.0     # tek komutta max adım (mm)
-
+import random  # <-- RANDOM TARGET SEÇİMİ İÇİN
 
 # --- Kamera ve optik parametreler ---
 PIXEL_SIZE_UM = 2.5
 PIXEL_SIZE_MM = PIXEL_SIZE_UM / 1000.0
 FOCAL_LENGTH_MM = 12.39
 
+# Ekranda görmek istediğin pencere boyutu
+DISPLAY_W = 512
+DISPLAY_H = 512
+
 # --- Gimbal / seri port parametreleri ---
+PORT = "/dev/ttyUSB4"   # kendi portun
+BAUD = 250000           # Marlin baud
+FEEDRATE = 450         # G1 F hızı (mm/dk ya da senin birimin)
 SER_ENABLED = True      # Seri port açılmazsa sadece takip yapılır
+
+# Açısal hata → mm (veya kartının beklediği birim) çeviren gain
+K_AZ_MM_PER_DEG = 0.1   # azimut ekseni için
+K_EL_MM_PER_DEG = 0.1   # elevasyon ekseni için
+
+# Çok küçük hatalarda komut göndermemek için deadband
+AZ_DEADBAND_DEG = 0.02
+EL_DEADBAND_DEG = 0.02
+
+# Tek seferde gönderilecek maksimum adım (mm)
+MAX_STEP_MM = 0.5
+
+# Görüntü boyutu (ROI) – Pylon'daki değerler
+ROI_W = 2748
+ROI_H = 2800
+ROI_OFFX = 828
+ROI_OFFY = 230
+
+# --- Yazılımsal endstop limitleri (mm) ---
+# X ekseni: toplam 20 cm → -10 cm .. +10 cm
+# Y ekseni: toplam 8  cm → -4  cm .. +4  cm
+X_MIN_MM = -100.0   # -10 cm
+X_MAX_MM =  100.0   # +10 cm
+Y_MIN_MM = -40.0    # -4 cm
+Y_MAX_MM =  40.0    # +4 cm
 
 # Script başladığında kabul edilen referans konum (mm)
 current_x_mm = 0.0
 current_y_mm = 0.0
 
-SER_MKS_PORT = None
-SER_ARD1_PORT = None
-SER_ARD2_PORT = None
+ser = None
 
+# --- RASTGELE HEDEF AYARLARI ---
+HOLD_TIME_SEC = 5.0          # Hedefte kalma süresi
+CENTER_TOL_PX = 3            # "Merkezde say" toleransı (piksel)
+TARGET_LOST_MAX_DIST_PX = 60 # Hedeften kopma mesafesi
 
 # -------------------------------------------------
 #  Yardımcı fonksiyonlar
@@ -64,8 +72,7 @@ def pixels_to_angle(delta_x, delta_y):
 
 def detect_bright_circle_center_mono(img):
     """
-    Mono8 görüntüde, en büyük parlak yuvarlak cismin merkezini bul.
-    Eski beyaz daire takibi fonksiyonun.
+    Eski tek hedef fonksiyonun – ARTIK RANDOM MODE İÇİN KULLANMIYORUZ ama dursun.
     """
     if len(img.shape) == 3:
         gray = img[:, :, 0]
@@ -101,13 +108,10 @@ def detect_bright_circle_center_mono(img):
 
     return (cx, cy), radius, maxVal
 
+
 def detect_green_circle_center(img):
     """
-    Renkli görüntüde yeşil dairenin merkezini bul.
-    Adımlar:
-      - BGR → HSV
-      - Yeşil renk için maskeleme
-      - Maske üzerinden contour + centroid
+    Eski tek hedef fonksiyonun – ARTIK RANDOM MODE İÇİN KULLANMIYORUZ ama dursun.
     """
     if len(img.shape) == 2 or img.shape[2] == 1:
         img_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
@@ -116,13 +120,11 @@ def detect_green_circle_center(img):
 
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
-    # Yeşil renk aralığı (gerekirse ayarlarsın)
     lower_green = np.array([35, 60, 40], dtype=np.uint8)
     upper_green = np.array([85, 255, 255], dtype=np.uint8)
 
     mask = cv2.inRange(hsv, lower_green, upper_green)
 
-    # Gürültü azaltma
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
@@ -147,37 +149,10 @@ def detect_green_circle_center(img):
     cy = int(M["m01"] / M["m00"])
 
     radius = int(math.sqrt(area / math.pi))
-    maxVal = float(mask[cy, cx])  # maske yoğunluğu
+    maxVal = float(mask[cy, cx])
 
     return (cx, cy), radius, maxVal
 
-def detect_laser_circle_center(color_img):
-    """
-    Mavi lazer spotunu HSV uzayında bulur.
-    Çıkış: (center(x,y), radius, maxVal)
-    """
-    hsv = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, LASER_BLUE_LOWER, LASER_BLUE_UPPER)
-    mask = cv2.medianBlur(mask, 5)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        raise RuntimeError("Mavi lazer spotu bulunamadı (kontur yok).")
-
-    c = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(c)
-    if area < MIN_AREA_LASER:
-        raise RuntimeError(f"Lazer spot alanı çok küçük: {area:.1f}")
-
-    (x, y), radius = cv2.minEnclosingCircle(c)
-    x, y = int(x), int(y)
-    radius = int(radius)
-
-    laser_mask_roi = mask[max(0, y-5):y+5, max(0, x-5):x+5]
-    maxVal = float(laser_mask_roi.max()) if laser_mask_roi.size > 0 else 0.0
-    print("LASER HSV center pixel:", hsv[y, x])
-
-    return (x, y), radius, maxVal
 
 def set_exposure_basler(cam, exp_us):
     """Basler kamerada manuel exposure ayarla (µs)."""
@@ -204,6 +179,7 @@ def set_exposure_basler(cam, exp_us):
     print("Exposure set to:", val, "us")
     return val
 
+
 def snap_to_inc(val, inc):
     """Değerleri node'un increment'ine oturt."""
     try:
@@ -211,6 +187,7 @@ def snap_to_inc(val, inc):
     except Exception:
         inc = 1
     return val if inc <= 1 else (val // inc) * inc
+
 
 def set_safe(node, value):
     """GenICam node'a güvenli yaz (min/max clamp)."""
@@ -223,10 +200,10 @@ def set_safe(node, value):
         pass
     node.SetValue(value)
 
+
 def set_roi_basler(cam, roi_w, roi_h, offx, offy):
     """Basler kamerada ROI ayarı (Width, Height, OffsetX, OffsetY)."""
     try:
-        # 1) Offset'leri sıfıra çek
         try:
             set_safe(cam.OffsetX, 0)
         except Exception:
@@ -236,7 +213,6 @@ def set_roi_basler(cam, roi_w, roi_h, offx, offy):
         except Exception:
             pass
 
-        # 2) Artışları (increment) oku
         try:
             w_inc = cam.Width.GetInc()
         except Exception:
@@ -257,13 +233,11 @@ def set_roi_basler(cam, roi_w, roi_h, offx, offy):
         except Exception:
             oy_inc = 1
 
-        # 3) Width/Height
         W = snap_to_inc(roi_w, w_inc)
         H = snap_to_inc(roi_h, h_inc)
         set_safe(cam.Width, W)
         set_safe(cam.Height, H)
 
-        # 4) OffsetX/OffsetY
         OX = snap_to_inc(offx, ox_inc)
         OY = snap_to_inc(offy, oy_inc)
         set_safe(cam.OffsetX, OX)
@@ -274,13 +248,13 @@ def set_roi_basler(cam, roi_w, roi_h, offx, offy):
     except Exception as e:
         print("ROI ayarlanamadı:", e)
 
+
 def open_basler_camera():
     """
     İlk bulunan Basler GigE (tercihen) veya başka bir Basler kamerayı açar.
     """
     tl_factory = pylon.TlFactory.GetInstance()
 
-    # Önce GigE TL üzerinden enumerate dene
     gige_tl = None
     for tl_info in tl_factory.EnumerateTls():
         if "GigE" in tl_info.GetDeviceClass():
@@ -296,7 +270,6 @@ def open_basler_camera():
         except Exception as e:
             print("GigE EnumerateAllDevices hata verdi:", e)
 
-    # Fallback
     if not devices:
         print("GigE enumerate sonuçsuz, TlFactory.EnumerateDevices() ile tekrar deneniyor...")
         devices = tl_factory.EnumerateDevices()
@@ -315,7 +288,6 @@ def open_basler_camera():
 
     print(f"✅ Bağlı Basler kamera: {di.GetModelName()} [{serial_no}]")
 
-    # GigE ise paket boyutunu optimize etmeye çalış
     try:
         if hasattr(cam, "GevSCPSPacketSize") and cam.GevSCPSPacketSize.IsWritable():
             cam.GevSCPSPacketSize.SetValue(cam.GevSCPSPacketSize.Max)
@@ -338,8 +310,8 @@ def init_serial():
         return
 
     try:
-        ser = serial.Serial(SER_MKS_PORT, cfg.BAUD_MKS, timeout=0.01)
-        print(f"Seri port açıldı: {SER_MKS_PORT} @ {cfg.BAUD_MKS}")
+        ser = serial.Serial(PORT, BAUD, timeout=0.01)
+        print(f"Seri port açıldı: {PORT} @ {BAUD}")
         time.sleep(2.0)  # Marlin reset için
         send_gcode("G91")  # Göreceli mod
     except Exception as e:
@@ -364,18 +336,6 @@ def send_gcode(cmd: str):
     except Exception as e:
         print("G-code gönderilemedi:", e)
 
-def move_laser_gimbal_relative(dx_mm, dy_mm):
-    """
-    Lazer gimbalını relatif modda hareket ettirir.
-    dx_mm, dy_mm = X/Y ekseninde gidilecek mesafe (mm).
-    """
-
-    if abs(dx_mm) < 1e-6 and abs(dy_mm) < 1e-6:
-        return
-
-    # G91 relatif, G90 absolute
-    cmd = f"G1 Z{dx_mm:.3f} A{dy_mm:.3f} F{cfg.FEEDRATE}\n"
-    send_gcode(cmd)
 
 def send_to_gimbal(az_deg, el_deg):
     """
@@ -389,38 +349,34 @@ def send_to_gimbal(az_deg, el_deg):
               f"[X={current_x_mm:.2f}mm Y={current_y_mm:.2f}mm]")
         return
 
-    # Deadband
-    if abs(az_deg) < cfg.AZ_DEADBAND_DEG and abs(el_deg) < cfg.EL_DEADBAND_DEG:
+    if abs(az_deg) < AZ_DEADBAND_DEG and abs(el_deg) < EL_DEADBAND_DEG:
         return
 
-    # Negatif feedback
-    step_x = -cfg.K_AZ_MM_PER_DEG * az_deg
-    step_y =  cfg.K_EL_MM_PER_DEG * el_deg
+    step_x = -K_AZ_MM_PER_DEG * az_deg
+    step_y =  K_EL_MM_PER_DEG * el_deg
 
-    # Frame başına limit
-    step_x = max(min(step_x, cfg.MAX_STEP_MM), -cfg.MAX_STEP_MM)
-    step_y = max(min(step_y, cfg.MAX_STEP_MM), -cfg.MAX_STEP_MM)
+    step_x = max(min(step_x, MAX_STEP_MM), -MAX_STEP_MM)
+    step_y = max(min(step_y, MAX_STEP_MM), -MAX_STEP_MM)
 
-    # Yazılımsal endstop
     target_x = current_x_mm + step_x
     target_y = current_y_mm + step_y
 
-    if target_x > cfg.X_MAX_MM:
-        step_x = cfg.X_MAX_MM - current_x_mm
-        target_x = cfg.X_MAX_MM
+    if target_x > X_MAX_MM:
+        step_x = X_MAX_MM - current_x_mm
+        target_x = X_MAX_MM
         print("⚠ X yazılımsal endstop (üst limit)!")
-    elif target_x < cfg.X_MIN_MM:
-        step_x = cfg.X_MIN_MM - current_x_mm
-        target_x = cfg.X_MIN_MM
+    elif target_x < X_MIN_MM:
+        step_x = X_MIN_MM - current_x_mm
+        target_x = X_MIN_MM
         print("⚠ X yazılımsal endstop (alt limit)!")
 
-    if target_y > cfg.Y_MAX_MM:
-        step_y = cfg.Y_MAX_MM - current_y_mm
-        target_y = cfg.Y_MAX_MM
+    if target_y > Y_MAX_MM:
+        step_y = Y_MAX_MM - current_y_mm
+        target_y = Y_MAX_MM
         print("⚠ Y yazılımsal endstop (üst limit)!")
-    elif target_y < cfg.Y_MIN_MM:
-        step_y = cfg.Y_MIN_MM - current_y_mm
-        target_y = cfg.Y_MIN_MM
+    elif target_y < Y_MIN_MM:
+        step_y = Y_MIN_MM - current_y_mm
+        target_y = Y_MIN_MM
         print("⚠ Y yazılımsal endstop (alt limit)!")
 
     if abs(step_x) < 1e-3:
@@ -436,7 +392,7 @@ def send_to_gimbal(az_deg, el_deg):
         cmd_parts.append(f"X{step_x:.3f}")
     if step_y != 0.0:
         cmd_parts.append(f"Y{step_y:.3f}")
-    cmd = "G1 " + " ".join(cmd_parts) + f" F{cfg.FEEDRATE}"
+    cmd = "G1 " + " ".join(cmd_parts) + f" F{FEEDRATE}"
     send_gcode(cmd)
 
     current_x_mm += step_x
@@ -446,25 +402,98 @@ def send_to_gimbal(az_deg, el_deg):
 
 
 # -------------------------------------------------
-#  Ana takip döngüsü
+#  Birden fazla noktayı bulmak için yeni fonksiyonlar
+# -------------------------------------------------
+def find_white_points(img_bgr, min_area=30, thresh_val=220):
+    """
+    Renkten bağımsız, parlak (beyaza yakın) noktaları bul.
+    Dönen liste: (cx, cy, radius, area)
+    """
+    # BGR -> Gri
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Parlaklık threshold: thresh_val'ı ortam ışığına göre oynat
+    _, mask = cv2.threshold(gray, thresh_val, 255, cv2.THRESH_BINARY)
+
+    # Gürültü temizliği
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    points = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        M = cv2.moments(cnt)
+        if M["m00"] == 0:
+            continue
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        radius = int(math.sqrt(area / math.pi))
+        points.append((cx, cy, radius, area))
+
+    return points, mask
+
+
+def find_bright_points_mono(img, min_area=20):
+    """Mono görüntüde birden fazla parlak noktayı döndürür."""
+    if len(img.shape) == 3:
+        gray = img[:, :, 0]
+    else:
+        gray = img
+
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(
+        blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    contours, _ = cv2.findContours(
+        thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    points = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        M = cv2.moments(cnt)
+        if M["m00"] == 0:
+            continue
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        radius = int(math.sqrt(area / math.pi))
+        points.append((cx, cy, radius, area))
+    return points, gray
+
+
+# -------------------------------------------------
+#  Ana takip döngüsü – RANDOM HEDEF + 5 sn bekleme
 # -------------------------------------------------
 def track_star():
     cam = open_basler_camera()
     init_serial()
 
-    # Bu değişkenlerle frame içinde ne yapacağımızı belirleyeceğiz
     pixel_format = "Unknown"
     is_bayer = False
     is_true_mono = False
 
+    # RASTGELE HEDEF STATE
+    current_target = None      # (cx, cy, radius, area)
+    target_center_px = None    # (cx, cy)
+    target_centered_t = None   # merkezdeyken zaman
+    rng = random.Random()      # istersen rng.seed(...) ile deterministik yaparsın
+
     try:
-        # PixelFormat ayarla / oku
         try:
             if cam.PixelFormat.IsWritable():
                 enum_entries = cam.PixelFormat.GetSymbolics()
                 print("Mevcut PixelFormat seçenekleri:", enum_entries)
 
-                # Önce doğrudan BGR8/RGB8Packed dene
                 if "BGR8" in enum_entries:
                     cam.PixelFormat.SetValue("BGR8")
                     print("🎨 PixelFormat → BGR8 (renkli)")
@@ -478,7 +507,6 @@ def track_star():
         except Exception as e:
             print("PixelFormat ayarlanırken hata:", e)
 
-        # Gerçek PixelFormat'ı oku
         try:
             pixel_format = cam.PixelFormat.GetValue()
             print("Aktif PixelFormat:", pixel_format)
@@ -489,11 +517,9 @@ def track_star():
         except Exception as e:
             print("Aktif PixelFormat okunamadı:", e)
 
-        # ROI ve exposure
-        set_roi_basler(cam, cfg.ROI_W, cfg.ROI_H, cfg.ROI_OFFX, cfg.ROI_OFFY)
+        set_roi_basler(cam, ROI_W, ROI_H, ROI_OFFX, ROI_OFFY)
         current_exp = set_exposure_basler(cam, 22600.0)
 
-        # AcquisitionMode → Continuous
         try:
             if cam.AcquisitionMode.IsWritable():
                 cam.AcquisitionMode.SetValue("Continuous")
@@ -518,15 +544,13 @@ def track_star():
                 grabResult.Release()
                 continue
 
-            image = grabResult.Array  # H x W veya H x W x C
+            image = grabResult.Array
             grabResult.Release()
 
-            detection_mode = "green"  # varsayılan
+            detection_mode = "green"
 
             if len(image.shape) == 2:
-                # Tek kanal veri: Bayer mi, gerçek mono mu?
                 if is_bayer:
-                    # Bayer → BGR convert
                     if pixel_format == "BayerRG8":
                         color_img = cv2.cvtColor(image, cv2.COLOR_BAYER_RG2BGR)
                     elif pixel_format == "BayerBG8":
@@ -534,41 +558,41 @@ def track_star():
                     elif pixel_format == "BayerGR8":
                         color_img = cv2.cvtColor(image, cv2.COLOR_BAYER_GR2BGR)
                     elif pixel_format == "BayerGB8":
-                        color_img = cv2.cvtColor(image, cv2.COLOR_BAYER_GB2BGR)
+                        color_img = cv2.cvtColor(image, cv2.COLOR_BAYER_GB2RGB)
                     else:
-                        # Bilinmeyen Bayer: yine de bir şey deneyelim
                         color_img = cv2.cvtColor(image, cv2.COLOR_BAYER_RG2BGR)
                     detection_mode = "green"
                 else:
-                    # Gerçek Mono8 vb.
-                    print("⚠ Görüntü gerçek tek kanal (mono), renk tespiti olmayacak, parlak daireye düşüyorum.")
+                    print("⚠ Görüntü gerçek tek kanal (mono), renk tespiti olmayacak, parlak noktalara geçiyorum.")
                     gray_img = image
                     color_img = cv2.cvtColor(gray_img, cv2.COLOR_GRAY2BGR)
                     detection_mode = "mono"
             else:
-                # Zaten H x W x 3 → BGR varsay
                 color_img = image
                 detection_mode = "green"
 
             h, w = color_img.shape[:2]
             center = (w // 2, h // 2)
 
-            # --- NESNE TESPİTİ: YEŞİL HEDEF ---
-            try:
-                if detection_mode == "green":
-                    circle_center, radius_star, maxVal = detect_green_circle_center(color_img)
-                else:
-                    # mono parlak daire
-                    circle_center, radius_star, maxVal = detect_bright_circle_center_mono(color_img)
-            except Exception as e:
-                print(f"Nesne bulunamadı ({detection_mode}):", e)
+            # --- Birden fazla nokta tespiti ---
+            if detection_mode == "green":
+                points, aux_img = find_white_points(color_img)
+            else:
+                points, aux_img = find_bright_points_mono(color_img)
+
+            if not points:
+                print("Nokta bulunamadı, hedef sıfırlanıyor.")
+                current_target = None
+                target_center_px = None
+                target_centered_t = None
+
                 annotated = color_img.copy()
                 cv2.drawMarker(
                     annotated, center, (0, 255, 0),
                     cv2.MARKER_CROSS, 20, 2
                 )
                 display_img = cv2.resize(
-                    annotated, (cfg.DISPLAY_W, cfg.DISPLAY_H),
+                    annotated, (DISPLAY_W, DISPLAY_H),
                     interpolation=cv2.INTER_AREA
                 )
                 cv2.imshow("Circle Tracking", display_img)
@@ -577,71 +601,81 @@ def track_star():
                     break
                 continue
 
-            cx, cy = circle_center
+            # --- Hedef seçimi: random ---
+            if current_target is None:
+                current_target = rng.choice(points)  # (cx, cy, radius, area)
+                target_center_px = (current_target[0], current_target[1])
+                target_centered_t = None
+                print(f"🎯 Yeni rastgele hedef: {target_center_px}")
+
+            else:
+                # Aynı hedefi tutmak için: mevcut noktalardan target_center_px'e en yakın olanı bul
+                tx_prev, ty_prev = target_center_px
+                best = None
+                best_d = None
+                for (cx, cy, radius, area) in points:
+                    d = math.hypot(cx - tx_prev, cy - ty_prev)
+                    if best_d is None or d < best_d:
+                        best_d = d
+                        best = (cx, cy, radius, area)
+
+                if best is None or best_d > TARGET_LOST_MAX_DIST_PX:
+                    # hedef kayboldu → yeni rastgele hedef
+                    current_target = rng.choice(points)
+                    target_center_px = (current_target[0], current_target[1])
+                    target_centered_t = None
+                    print(f"🎯 Hedef kayboldu, yeni rastgele hedef: {target_center_px}")
+                else:
+                    current_target = best
+                    target_center_px = (current_target[0], current_target[1])
+
+            cx, cy, radius, area = current_target
             dx = cx - center[0]
             dy = center[1] - cy  # yukarı pozitif
 
             az_deg, el_deg = pixels_to_angle(dx, dy)
 
+            err_pix = math.hypot(dx, dy)
             mode_icon = "🟢" if detection_mode == "green" else "⚪"
             print(
-                f"{mode_icon} STAR mode={detection_mode} center={circle_center}  "
+                f"{mode_icon} mode={detection_mode} target={target_center_px}  "
                 f"Δx={dx:4d} Δy={dy:4d}  "
-                f"az={az_deg:7.3f}° el={el_deg:7.3f}°  I={maxVal:.1f}"
+                f"az={az_deg:7.3f}° el={el_deg:7.3f}°  |err|={err_pix:.1f}"
             )
 
-            # --- KAMERA GİMBAL KOMUTU (AYNI KALDI) ---
+            # --- Gimbale komut (hedefe hizalama) ---
             send_to_gimbal(az_deg, el_deg)
 
-            # --- OVERLAY BAŞLANGIÇ ---
+            # --- 5 saniye merkezde kalma mantığı ---
+            now = time.time()
+            if err_pix <= CENTER_TOL_PX:
+                if target_centered_t is None:
+                    target_centered_t = now
+                    print("✅ Hedef merkezde, timer başlatıldı.")
+                else:
+                    if (now - target_centered_t) >= HOLD_TIME_SEC:
+                        print(f"⏱ Hedefte {HOLD_TIME_SEC} sn bekledim, yeni hedefe geçiyorum.")
+                        current_target = None
+                        target_center_px = None
+                        target_centered_t = None
+            else:
+                # merkezde değilse timer reset
+                target_centered_t = None
+
+            # --- Görsel overlay ---
             annotated = color_img.copy()
             cv2.drawMarker(
                 annotated, center, (0, 255, 0),
                 cv2.MARKER_CROSS, 20, 2
             )
-            cv2.circle(annotated, (cx, cy), radius_star, (255, 0, 0), 2)
-            cv2.circle(annotated, (cx, cy), 3, (0, 0, 255), -1)
 
-            # ================= LAZER TAKİP BLOĞU =================
-            try:
-                laser_center, radius_laser, laser_I = detect_laser_circle_center(color_img)
-                lx, ly = laser_center
+            # Tüm noktaları çiz
+            for (px, py, r, a) in points:
+                cv2.circle(annotated, (px, py), max(r, 3), (255, 0, 0), 1)
 
-                # Lazer → YILDIZ hizalama: lazer yeşil noktaya kilitlensin
-                dx_laser_px = cx - lx          # hedef: yeşil nokta
-                dy_laser_px = ly - cy          # ekran koordinatına göre
-
-                az_laser_deg, el_laser_deg = pixels_to_angle(dx_laser_px, dy_laser_px)
-
-                # Deadband
-                if abs(az_laser_deg) < LASER_DEADBAND_DEG:
-                    az_laser_deg = 0.0
-                if abs(el_laser_deg) < LASER_DEADBAND_DEG:
-                    el_laser_deg = 0.0
-
-                # BURAYA KENDİ LAZER GİMBAL KOMUTUNU BAĞLA
-                # Örn: send_to_laser_gimbal(az_laser_deg, el_laser_deg)
-                try:
-                    move_laser_gimbal_relative(az_laser_deg, el_laser_deg)
-                except NameError:
-                    # Henüz tanımlamadıysan sessizce geç, sadece log yaz
-                    pass
-
-                print(
-                    f"🔴 LASER center={laser_center} "
-                    f"Δx_laser={dx_laser_px:4d} Δy_laser={dy_laser_px:4d} "
-                    f"az_L={az_laser_deg:7.3f}° el_L={el_laser_deg:7.3f}° I_L={laser_I:.1f}"
-                )
-
-                # Overlay: lazeri de çiz
-                cv2.circle(annotated, (lx, ly), radius_laser, (0, 255, 255), 2)
-                cv2.circle(annotated, (lx, ly), 3, (0, 255, 255), -1)
-
-            except Exception as e:
-                # Lazer görünmüyorsa veya tespit edilemediyse sadece logla, takip döngüsü bozulmasın
-                # print(f"Lazer bulunamadı: {e}")
-                pass
-            # =====================================================
+            # Seçili hedefi farklı renkle vurgula
+            cv2.circle(annotated, (cx, cy), max(radius, 5), (0, 0, 255), 2)
+            cv2.circle(annotated, (cx, cy), 3, (0, 255, 255), -1)
 
             if current_exp is None:
                 exp_text = "Exp: N/A"
@@ -666,7 +700,7 @@ def track_star():
 
             display_img = cv2.resize(
                 annotated,
-                (cfg.DISPLAY_W, cfg.DISPLAY_H),
+                (DISPLAY_W, DISPLAY_H),
                 interpolation=cv2.INTER_AREA
             )
             cv2.imshow("Circle Tracking", display_img)
@@ -694,24 +728,5 @@ def track_star():
                 pass
 
 
-def main ():
-    global SER_MKS_PORT
-    global SER_ARD1_PORT
-    global SER_ARD2_PORT
-
-    mks_port, ard_ports = list_serial_ports()
-    SER_MKS_PORT = mks_port
-    SER_ARD1_PORT = ard_ports[0]
-    SER_ARD2_PORT = ard_ports[1]
-
-    threads = []
-    for port in ard_ports:
-        t = threading.Thread(target=arduino_worker, args=(port,), daemon=True)
-        t.start()
-        threads.append(t)
-    track_star()
-    
-
-
 if __name__ == "__main__":
-    main()
+    track_star()

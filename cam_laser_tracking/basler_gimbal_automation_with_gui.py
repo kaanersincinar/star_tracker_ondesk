@@ -7,40 +7,54 @@ import serial
 import serial.tools.list_ports
 import config as cfg
 import threading
+import os
+import tkinter as tk
+from tkinter import ttk
+from datetime import datetime
+from PIL import Image, ImageTk
 
 from port_listener import list_serial_ports
-from magnetic_reader import arduino_worker
 
-# --- Lazer tespiti için HSV aralığı (kırmızı lazer varsayıyorum) ---
-# LASER_RED1_LOWER = (0,   120, 200)
-# LASER_RED1_UPPER = (10,  255, 255)
-# LASER_RED2_LOWER = (170, 120, 200)
-# LASER_RED2_UPPER = (180, 255, 255)
+# -------------------------------------------------
+#  Ortak sabitler
+# -------------------------------------------------
 
-# --- Mavi lazer HSV aralığı ---
-LASER_BLUE_LOWER = (90,  80, 120)
+# --- Lazer tespiti için HSV aralığı (mavi lazer) ---
+LASER_BLUE_LOWER = (90, 80, 120)
 LASER_BLUE_UPPER = (140, 255, 255)
-
-
-MIN_AREA_LASER = 5  # lazer noktası için minimum alan (px^2) - gerekirse küçült
+MIN_AREA_LASER = 5
 
 # --- Lazer gimbali için kontrol gain'leri ---
-K_AZ_MM_PER_DEG_LASER = 0.1   # senin mekaniğine göre tune et
+K_AZ_MM_PER_DEG_LASER = 0.1
 K_EL_MM_PER_DEG_LASER = 0.1
 
-LASER_DEADBAND_DEG = 0.02     # çok küçük hataları ignore et
-MAX_STEP_MM_LASER   = 2.0     # tek komutta max adım (mm)
-
+LASER_DEADBAND_DEG = 0.02
+MAX_STEP_MM_LASER = 2.0
 
 # --- Kamera ve optik parametreler ---
 PIXEL_SIZE_UM = 2.5
 PIXEL_SIZE_MM = PIXEL_SIZE_UM / 1000.0
 FOCAL_LENGTH_MM = 12.39
 
-# --- Gimbal / seri port parametreleri ---
-SER_ENABLED = True      # Seri port açılmazsa sadece takip yapılır
+# --- Seri haberleşme / manyetik cetvel protokolü (GUI tarafı) ---
+BAUD_ARDUINO = 115200
+START_BYTE = 0x7E
+END_BYTE = 0x7F
+MSG_SENSOR = 0x10
+FRAME_SIZE = 16
 
-# Script başladığında kabul edilen referans konum (mm)
+# --- Manyetik cetvel kalibrasyonları (GUI göstergesi için) ---
+X_MM_PER_COUNT = 10.0 / 7459.0
+Y_MM_PER_COUNT = 10.0 / 6875.0
+AZ_MM_PER_COUNT = 0.001
+
+# Logo path (GUI)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGO_PATH = os.path.join(BASE_DIR, "UZAY-Yatay-Beyaz.png")
+
+# --- Gimbal / seri port parametreleri ---
+SER_ENABLED = True  # Seri port kapatırsan sadece takip yapılır
+
 current_x_mm = 0.0
 current_y_mm = 0.0
 
@@ -48,9 +62,11 @@ SER_MKS_PORT = None
 SER_ARD1_PORT = None
 SER_ARD2_PORT = None
 
+ser = None  # MKS seri handle
+
 
 # -------------------------------------------------
-#  Yardımcı fonksiyonlar
+#  Yardımcı fonksiyonlar (kamera + lazer)
 # -------------------------------------------------
 
 def pixels_to_angle(delta_x, delta_y):
@@ -63,10 +79,7 @@ def pixels_to_angle(delta_x, delta_y):
 
 
 def detect_bright_circle_center_mono(img):
-    """
-    Mono8 görüntüde, en büyük parlak yuvarlak cismin merkezini bul.
-    Eski beyaz daire takibi fonksiyonun.
-    """
+    """Mono8 görüntüde en büyük parlak yuvarlak cismin merkezini bulur."""
     if len(img.shape) == 3:
         gray = img[:, :, 0]
     else:
@@ -101,14 +114,9 @@ def detect_bright_circle_center_mono(img):
 
     return (cx, cy), radius, maxVal
 
+
 def detect_green_circle_center(img):
-    """
-    Renkli görüntüde yeşil dairenin merkezini bul.
-    Adımlar:
-      - BGR → HSV
-      - Yeşil renk için maskeleme
-      - Maske üzerinden contour + centroid
-    """
+    """Renkli görüntüde yeşil dairenin merkezini bul."""
     if len(img.shape) == 2 or img.shape[2] == 1:
         img_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     else:
@@ -116,13 +124,11 @@ def detect_green_circle_center(img):
 
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
-    # Yeşil renk aralığı (gerekirse ayarlarsın)
     lower_green = np.array([35, 60, 40], dtype=np.uint8)
     upper_green = np.array([85, 255, 255], dtype=np.uint8)
 
     mask = cv2.inRange(hsv, lower_green, upper_green)
 
-    # Gürültü azaltma
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
@@ -137,7 +143,7 @@ def detect_green_circle_center(img):
     big_cnt = max(contours, key=cv2.contourArea)
     area = cv2.contourArea(big_cnt)
     if area < 50:
-        raise ValueError("Algılanan yeşil kontur çok küçük (muhtemelen gürültü).")
+        raise ValueError("Algılanan yeşil kontur çok küçük (gürültü).")
 
     M = cv2.moments(big_cnt)
     if M["m00"] == 0:
@@ -147,20 +153,20 @@ def detect_green_circle_center(img):
     cy = int(M["m01"] / M["m00"])
 
     radius = int(math.sqrt(area / math.pi))
-    maxVal = float(mask[cy, cx])  # maske yoğunluğu
+    maxVal = float(mask[cy, cx])
 
     return (cx, cy), radius, maxVal
 
+
 def detect_laser_circle_center(color_img):
-    """
-    Mavi lazer spotunu HSV uzayında bulur.
-    Çıkış: (center(x,y), radius, maxVal)
-    """
+    """Mavi lazer spotunu HSV uzayında bulur."""
     hsv = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, LASER_BLUE_LOWER, LASER_BLUE_UPPER)
     mask = cv2.medianBlur(mask, 5)
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
     if not contours:
         raise RuntimeError("Mavi lazer spotu bulunamadı (kontur yok).")
 
@@ -175,9 +181,13 @@ def detect_laser_circle_center(color_img):
 
     laser_mask_roi = mask[max(0, y-5):y+5, max(0, x-5):x+5]
     maxVal = float(laser_mask_roi.max()) if laser_mask_roi.size > 0 else 0.0
-    print("LASER HSV center pixel:", hsv[y, x])
 
     return (x, y), radius, maxVal
+
+
+# -------------------------------------------------
+#  Basler kamera yardımcıları
+# -------------------------------------------------
 
 def set_exposure_basler(cam, exp_us):
     """Basler kamerada manuel exposure ayarla (µs)."""
@@ -186,7 +196,7 @@ def set_exposure_basler(cam, exp_us):
             cam.ExposureAuto.SetValue("Off")
             print("ExposureAuto → Off")
     except Exception as e:
-        print("ExposureAuto kapatılamadı (önemli değil olabilir):", e)
+        print("ExposureAuto kapatılamadı:", e)
 
     try:
         node = cam.ExposureTime
@@ -204,16 +214,16 @@ def set_exposure_basler(cam, exp_us):
     print("Exposure set to:", val, "us")
     return val
 
+
 def snap_to_inc(val, inc):
-    """Değerleri node'un increment'ine oturt."""
     try:
         inc = int(inc)
     except Exception:
         inc = 1
     return val if inc <= 1 else (val // inc) * inc
 
+
 def set_safe(node, value):
-    """GenICam node'a güvenli yaz (min/max clamp)."""
     try:
         vmin = node.GetMin()
         vmax = node.GetMax()
@@ -223,10 +233,10 @@ def set_safe(node, value):
         pass
     node.SetValue(value)
 
+
 def set_roi_basler(cam, roi_w, roi_h, offx, offy):
     """Basler kamerada ROI ayarı (Width, Height, OffsetX, OffsetY)."""
     try:
-        # 1) Offset'leri sıfıra çek
         try:
             set_safe(cam.OffsetX, 0)
         except Exception:
@@ -236,7 +246,6 @@ def set_roi_basler(cam, roi_w, roi_h, offx, offy):
         except Exception:
             pass
 
-        # 2) Artışları (increment) oku
         try:
             w_inc = cam.Width.GetInc()
         except Exception:
@@ -257,13 +266,11 @@ def set_roi_basler(cam, roi_w, roi_h, offx, offy):
         except Exception:
             oy_inc = 1
 
-        # 3) Width/Height
         W = snap_to_inc(roi_w, w_inc)
         H = snap_to_inc(roi_h, h_inc)
         set_safe(cam.Width, W)
         set_safe(cam.Height, H)
 
-        # 4) OffsetX/OffsetY
         OX = snap_to_inc(offx, ox_inc)
         OY = snap_to_inc(offy, oy_inc)
         set_safe(cam.OffsetX, OX)
@@ -274,13 +281,11 @@ def set_roi_basler(cam, roi_w, roi_h, offx, offy):
     except Exception as e:
         print("ROI ayarlanamadı:", e)
 
+
 def open_basler_camera():
-    """
-    İlk bulunan Basler GigE (tercihen) veya başka bir Basler kamerayı açar.
-    """
+    """İlk bulunan Basler kamerayı açar (önce GigE deniyor)."""
     tl_factory = pylon.TlFactory.GetInstance()
 
-    # Önce GigE TL üzerinden enumerate dene
     gige_tl = None
     for tl_info in tl_factory.EnumerateTls():
         if "GigE" in tl_info.GetDeviceClass():
@@ -296,13 +301,12 @@ def open_basler_camera():
         except Exception as e:
             print("GigE EnumerateAllDevices hata verdi:", e)
 
-    # Fallback
     if not devices:
-        print("GigE enumerate sonuçsuz, TlFactory.EnumerateDevices() ile tekrar deneniyor...")
+        print("GigE enumerate sonuçsuz, TlFactory.EnumerateDevices() deneniyor...")
         devices = tl_factory.EnumerateDevices()
 
     if not devices:
-        raise RuntimeError("Hiç Basler kamera bulunamadı (GigE + USB).")
+        raise RuntimeError("Hiç Basler kamera bulunamadı.")
 
     cam = pylon.InstantCamera(tl_factory.CreateDevice(devices[0]))
     cam.Open()
@@ -315,7 +319,6 @@ def open_basler_camera():
 
     print(f"✅ Bağlı Basler kamera: {di.GetModelName()} [{serial_no}]")
 
-    # GigE ise paket boyutunu optimize etmeye çalış
     try:
         if hasattr(cam, "GevSCPSPacketSize") and cam.GevSCPSPacketSize.IsWritable():
             cam.GevSCPSPacketSize.SetValue(cam.GevSCPSPacketSize.Max)
@@ -329,6 +332,7 @@ def open_basler_camera():
 # -------------------------------------------------
 #  Seri port / gimbal fonksiyonları
 # -------------------------------------------------
+
 def init_serial():
     """Marlin kart ile seri haberleşmeyi başlat."""
     global ser
@@ -338,12 +342,12 @@ def init_serial():
         return
 
     try:
-        ser = serial.Serial(SER_MKS_PORT, cfg.BAUD_MKS, timeout=0.01)
+        #ser = serial.Serial(SER_MKS_PORT, cfg.BAUD_MKS, timeout=0.01)
         print(f"Seri port açıldı: {SER_MKS_PORT} @ {cfg.BAUD_MKS}")
-        time.sleep(2.0)  # Marlin reset için
+        time.sleep(2.0)
         send_gcode("G91")  # Göreceli mod
     except Exception as e:
-        print("Seri port açılamadı, sadece görüntü takibi yapılacak:", e)
+        print("Seri port açılamadı, sadece görüntü takibi:", e)
         ser = None
 
 
@@ -364,24 +368,18 @@ def send_gcode(cmd: str):
     except Exception as e:
         print("G-code gönderilemedi:", e)
 
-def move_laser_gimbal_relative(dx_mm, dy_mm):
-    """
-    Lazer gimbalını relatif modda hareket ettirir.
-    dx_mm, dy_mm = X/Y ekseninde gidilecek mesafe (mm).
-    """
 
+def move_laser_gimbal_relative(dx_mm, dy_mm):
+    """Lazer gimbalını relatif modda hareket ettirir."""
     if abs(dx_mm) < 1e-6 and abs(dy_mm) < 1e-6:
         return
 
-    # G91 relatif, G90 absolute
     cmd = f"G1 Z{dx_mm:.3f} A{dy_mm:.3f} F{cfg.FEEDRATE}\n"
     send_gcode(cmd)
 
+
 def send_to_gimbal(az_deg, el_deg):
-    """
-    Kamera merkezine göre bulunan açısal hatayı
-    X/Y eksenlerine göre G-code hareketine çevirir.
-    """
+    """Kamera gimbali için açısal hatayı G-code'a çevirir."""
     global ser, current_x_mm, current_y_mm
 
     if ser is None:
@@ -389,19 +387,15 @@ def send_to_gimbal(az_deg, el_deg):
               f"[X={current_x_mm:.2f}mm Y={current_y_mm:.2f}mm]")
         return
 
-    # Deadband
     if abs(az_deg) < cfg.AZ_DEADBAND_DEG and abs(el_deg) < cfg.EL_DEADBAND_DEG:
         return
 
-    # Negatif feedback
     step_x = -cfg.K_AZ_MM_PER_DEG * az_deg
     step_y =  cfg.K_EL_MM_PER_DEG * el_deg
 
-    # Frame başına limit
     step_x = max(min(step_x, cfg.MAX_STEP_MM), -cfg.MAX_STEP_MM)
     step_y = max(min(step_y, cfg.MAX_STEP_MM), -cfg.MAX_STEP_MM)
 
-    # Yazılımsal endstop
     target_x = current_x_mm + step_x
     target_y = current_y_mm + step_y
 
@@ -446,39 +440,411 @@ def send_to_gimbal(az_deg, el_deg):
 
 
 # -------------------------------------------------
-#  Ana takip döngüsü
+#  GUI: Telemetry + kamera gösterimi
 # -------------------------------------------------
-def track_star():
+
+
+
+class TelemetryGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Magnetic Ruler + Camera Dashboard")
+        self.root.geometry("1600x900")
+        self.root.configure(bg="#e5e5e5")
+
+        self.node_data = {
+            1: {'x': 0, 'y': 0, 'az': 0, 'last_update': None, 'active': False},
+            2: {'x': 0, 'y': 0, 'az': 0, 'last_update': None, 'active': False}
+        }
+
+        self.camera_frame = None
+        self.camera_active = False
+        self.camera_lock = threading.Lock()
+
+        self.create_widgets()
+        self.update_display()
+
+    def create_widgets(self):
+        header_frame = tk.Frame(self.root, bg="#2b2b2b")
+        header_frame.pack(fill=tk.X, pady=10)
+
+        logo_frame = tk.Frame(header_frame, bg="#2b2b2b")
+        logo_frame.pack(side=tk.LEFT, padx=20)
+
+        try:
+            img = Image.open(LOGO_PATH)
+            img = img.resize((864, 301), Image.Resampling.LANCZOS)#1400x502px original resolution.
+            self.logo_photo = ImageTk.PhotoImage(img)
+            logo_label = tk.Label(logo_frame, image=self.logo_photo, bg="#2b2b2b")
+            logo_label.pack()
+        except Exception as e:
+            print(f"Could not load logo: {e}")
+
+        title_frame = tk.Frame(header_frame, bg="#2b2b2b")
+        title_frame.pack(side=tk.LEFT, padx=450)
+
+        title = tk.Label(
+            title_frame,
+            text="Gimbal Automation ",
+            font=("Gotham", 36, "bold"),
+            fg="#ffffff",
+            bg="#2b2b2b"
+        )
+        title.pack(anchor=tk.W)
+
+        subtitle = tk.Label(
+            title_frame,
+            text="Real-time camera and laser tracking, magnetic reader feedback system.",
+            font=("Gotham", 10),
+            fg="#9ca3af",
+            bg="#2b2b2b"
+        )
+        subtitle.pack(anchor=tk.W)
+
+        main_container = tk.Frame(self.root, bg="#2b2b2b")
+        main_container.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        telemetry_container = tk.Frame(main_container, bg="#2b2b2b")
+        telemetry_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        nodes_frame = tk.Frame(telemetry_container, bg="#2b2b2b")
+        nodes_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.node1_frame = self.create_node_card(nodes_frame, 1)
+        self.node1_frame.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
+
+        self.node2_frame = self.create_node_card(nodes_frame, 2)
+        self.node2_frame.grid(row=1, column=0, padx=5, pady=5, sticky="nsew")
+
+        nodes_frame.grid_rowconfigure(0, weight=1)
+        nodes_frame.grid_rowconfigure(1, weight=1)
+        nodes_frame.grid_columnconfigure(0, weight=1)
+
+        camera_container = tk.Frame(
+            main_container,
+            bg="#3a3a3a",
+            relief=tk.RAISED,
+            borderwidth=2
+        )
+        camera_container.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
+
+        cam_header = tk.Frame(camera_container, bg="#3a3a3a")
+        cam_header.pack(fill=tk.X, padx=15, pady=15)
+
+        cam_title = tk.Label(
+            cam_header,
+            text="Camera Feed",
+            font=("Gotham", 20, "bold"),
+            fg="#ffffff",
+            bg="#3a3a3a"
+        )
+        cam_title.pack(side=tk.LEFT)
+
+        self.cam_status = tk.Label(
+            cam_header,
+            text="● Disconnected",
+            font=("Gotham", 11),
+            fg="#ef4444",
+            bg="#3a3a3a"
+        )
+        self.cam_status.pack(side=tk.RIGHT)
+
+        ttk.Separator(camera_container, orient='horizontal').pack(fill=tk.X, padx=15)
+
+        self.camera_label = tk.Label(
+            camera_container,
+            bg="#2b2b2b",
+            text="No Camera Feed",
+            font=("Gotham", 14),
+            fg="#6b7280"
+        )
+        self.camera_label.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+
+    def create_node_card(self, parent, node_id):
+        card = tk.Frame(parent, bg="#3a3a3a", relief=tk.RAISED, borderwidth=2)
+
+        header = tk.Frame(card, bg="#3a3a3a")
+        header.pack(fill=tk.X, padx=15, pady=15)
+
+        if node_id == 1:
+            title_text = "Gimbal Camera"
+        elif node_id == 2:
+            title_text = "Gimbal Laser"
+        else:
+            title_text = f"Node {node_id}"
+
+        title = tk.Label(
+            header,
+            text=title_text,
+            font=("Gotham", 20, "bold"),
+            fg="#ffffff",
+            bg="#3a3a3a"
+        )
+        title.pack(side=tk.LEFT)
+
+        status = tk.Label(
+            header,
+            text="● Disconnected",
+            font=("Gotham", 11),
+            fg="#ef4444",
+            bg="#3a3a3a"
+        )
+        status.pack(side=tk.RIGHT)
+        setattr(self, f'node{node_id}_status', status)
+
+        ttk.Separator(card, orient='horizontal').pack(fill=tk.X, padx=15)
+
+        axes_frame = tk.Frame(card, bg="#3a3a3a")
+        axes_frame.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+
+        self.create_axis_display(axes_frame, node_id, 'X', '#3b82f6', 0)
+        self.create_axis_display(axes_frame, node_id, 'Y', '#10b981', 1)
+        self.create_axis_display(axes_frame, node_id, 'AZ', '#f59e0b', 2)
+
+        update_label = tk.Label(
+            card,
+            text="Last update: --:--:--",
+            font=("Gotham", 9),
+            fg="#6b7280",
+            bg="#3a3a3a"
+        )
+        update_label.pack(pady=10)
+        setattr(self, f'node{node_id}_update', update_label)
+
+        return card
+
+    def create_axis_display(self, parent, node_id, axis, color, row):
+        frame = tk.Frame(parent, bg="#3a3a3a")
+        frame.pack(fill=tk.X, pady=8)
+
+        label_frame = tk.Frame(frame, bg="#3a3a3a")
+        label_frame.pack(fill=tk.X)
+
+        label = tk.Label(
+            label_frame,
+            text=f"{axis}-Axis",
+            font=("Gotham", 11, "bold"),
+            fg="#d1d5db",
+            bg="#3a3a3a"
+        )
+        label.pack(side=tk.LEFT)
+
+        count_label = tk.Label(
+            label_frame,
+            text="0",
+            font=("Gotham", 14, "bold"),
+            fg="#ffffff",
+            bg="#3a3a3a"
+        )
+        count_label.pack(side=tk.RIGHT)
+        setattr(self, f'node{node_id}_{axis.lower()}_count', count_label)
+
+        unit_label = tk.Label(
+            label_frame,
+            text="counts",
+            font=("Gotham", 9),
+            fg="#9ca3af",
+            bg="#3a3a3a"
+        )
+        unit_label.pack(side=tk.RIGHT, padx=(5, 10))
+
+        progress_frame = tk.Frame(frame, bg="#505050", height=12)
+        progress_frame.pack(fill=tk.X, pady=5)
+        progress_frame.pack_propagate(False)
+
+        progress_bar = tk.Frame(progress_frame, bg=color, width=0, height=12)
+        progress_bar.place(relx=0.5, rely=0, anchor='n')
+        setattr(self, f'node{node_id}_{axis.lower()}_bar', progress_bar)
+
+        mm_label = tk.Label(
+            frame,
+            text="0.000 mm",
+            font=("Gotham", 12, "bold"),
+            fg=color,
+            bg="#3a3a3a"
+        )
+        mm_label.pack(anchor=tk.E)
+        setattr(self, f'node{node_id}_{axis.lower()}_mm', mm_label)
+
+    def update_display(self):
+        for node_id in [1, 2]:
+            data = self.node_data[node_id]
+
+            status_label = getattr(self, f'node{node_id}_status')
+            if data['active'] and data['last_update']:
+                time_diff = time.time() - data['last_update']
+                if time_diff < 1.0:
+                    status_label.config(text="● Connected", fg="#10b981")
+                else:
+                    status_label.config(text="● Disconnected", fg="#ef4444")
+            else:
+                status_label.config(text="● Disconnected", fg="#ef4444")
+
+            for axis, mm_per_count in [('x', X_MM_PER_COUNT),
+                                       ('y', Y_MM_PER_COUNT),
+                                       ('az', AZ_MM_PER_COUNT)]:
+                count = data[axis]
+                mm = count * mm_per_count
+
+                count_label = getattr(self, f'node{node_id}_{axis}_count')
+                count_label.config(text=f"{count:,}")
+
+                mm_label = getattr(self, f'node{node_id}_{axis}_mm')
+                mm_label.config(text=f"{mm:.3f} mm")
+
+                bar = getattr(self, f'node{node_id}_{axis}_bar')
+                max_count = 10000
+                percentage = min(abs(count) / max_count, 1.0)
+                bar_width = int(percentage * 250)
+                bar.config(width=bar_width)
+
+            if data['last_update']:
+                timestamp = datetime.fromtimestamp(
+                    data['last_update']
+                ).strftime('%H:%M:%S')
+                update_label = getattr(self, f'node{node_id}_update')
+                update_label.config(text=f"Last update: {timestamp}")
+
+        # Kamera görüntüsünü GUI'ye bas
+        with self.camera_lock:
+            if self.camera_frame is not None:
+                try:
+                    frame_rgb = cv2.cvtColor(self.camera_frame, cv2.COLOR_BGR2RGB)
+
+                    container = self.camera_label
+                    container_w = container.winfo_width()
+                    container_h = container.winfo_height()
+                    if container_w < 50 or container_h < 50:
+                        container_w, container_h = 800, 600
+
+                    h, w = frame_rgb.shape[:2]
+                    scale = min(container_w / w, container_h / h)
+                    new_w, new_h = int(w * scale), int(h * scale)
+
+                    frame_resized = cv2.resize(
+                        frame_rgb, (new_w, new_h), interpolation=cv2.INTER_CUBIC
+                    )
+
+                    img = Image.fromarray(frame_resized)
+                    imgtk = ImageTk.PhotoImage(image=img)
+
+                    self.camera_label.config(image=imgtk, text="")
+                    self.camera_label.image = imgtk
+
+                    if self.camera_active:
+                        self.cam_status.config(text="● Active", fg="#10b981")
+                except Exception as e:
+                    print(f"Camera display error: {e}")
+            elif not self.camera_active:
+                self.cam_status.config(text="● Disconnected", fg="#ef4444")
+
+        self.root.after(50, self.update_display)
+
+    def update_node_data(self, node_id, x, y, az):
+        self.node_data[node_id]['x'] = x
+        self.node_data[node_id]['y'] = y
+        self.node_data[node_id]['az'] = az
+        self.node_data[node_id]['last_update'] = time.time()
+        self.node_data[node_id]['active'] = True
+
+    def update_camera_frame(self, frame):
+        with self.camera_lock:
+            self.camera_frame = frame.copy()
+            self.camera_active = True
+
+
+# -------------------------------------------------
+#  Arduino → GUI worker (manyetik cetvel)
+# -------------------------------------------------
+
+def parse_frame(frame: bytes):
+    if len(frame) != FRAME_SIZE:
+        return None
+    if frame[0] != START_BYTE or frame[-1] != END_BYTE:
+        return None
+
+    node_id = frame[1]
+    msg_type = frame[2]
+    if msg_type != MSG_SENSOR:
+        return None
+
+    x = int.from_bytes(frame[3:7], "big", signed=True)
+    y = int.from_bytes(frame[7:11], "big", signed=True)
+    az = int.from_bytes(frame[11:15], "big", signed=True)
+    return node_id, x, y, az
+
+
+def arduino_worker(port: str, gui: TelemetryGUI):
+    try:
+        ser_a = serial.Serial(port=port, baudrate=BAUD_ARDUINO, timeout=0.1)
+    except Exception as e:
+        print(f"{port} error: {e}")
+        return
+
+    print(f"[{port}] Listening for sensor data...")
+    buf = bytearray()
+
+    while True:
+        data = ser_a.read(64)
+        if not data:
+            continue
+        buf.extend(data)
+
+        while True:
+            if len(buf) < FRAME_SIZE:
+                break
+            try:
+                start_idx = buf.index(START_BYTE)
+            except ValueError:
+                buf.clear()
+                break
+            if start_idx > 0:
+                del buf[:start_idx]
+            if len(buf) < FRAME_SIZE:
+                break
+
+            frame = bytes(buf[:FRAME_SIZE])
+            res = parse_frame(frame)
+            if res is None:
+                del buf[0]
+                continue
+            del buf[:FRAME_SIZE]
+
+            node_id, x, y, az = res
+            gui.update_node_data(node_id, x, y, az)
+
+
+# -------------------------------------------------
+#  Ana takip döngüsü (GUI’ye entegre)
+# -------------------------------------------------
+
+def track_star(gui: TelemetryGUI):
     cam = open_basler_camera()
     init_serial()
 
-    # Bu değişkenlerle frame içinde ne yapacağımızı belirleyeceğiz
     pixel_format = "Unknown"
     is_bayer = False
     is_true_mono = False
 
     try:
-        # PixelFormat ayarla / oku
         try:
             if cam.PixelFormat.IsWritable():
                 enum_entries = cam.PixelFormat.GetSymbolics()
                 print("Mevcut PixelFormat seçenekleri:", enum_entries)
 
-                # Önce doğrudan BGR8/RGB8Packed dene
                 if "BGR8" in enum_entries:
                     cam.PixelFormat.SetValue("BGR8")
-                    print("🎨 PixelFormat → BGR8 (renkli)")
+                    print("🎨 PixelFormat → BGR8")
                 elif "RGB8Packed" in enum_entries:
                     cam.PixelFormat.SetValue("RGB8Packed")
-                    print("🎨 PixelFormat → RGB8Packed (renkli)")
+                    print("🎨 PixelFormat → RGB8Packed")
                 else:
-                    print("⚠ BGR8/RGB8Packed yok, mevcut formatla devam ediliyor.")
+                    print("⚠ BGR8/RGB8Packed yok, mevcut formatla devam.")
             else:
                 print("PixelFormat yazılabilir değil.")
         except Exception as e:
             print("PixelFormat ayarlanırken hata:", e)
 
-        # Gerçek PixelFormat'ı oku
         try:
             pixel_format = cam.PixelFormat.GetValue()
             print("Aktif PixelFormat:", pixel_format)
@@ -489,11 +855,9 @@ def track_star():
         except Exception as e:
             print("Aktif PixelFormat okunamadı:", e)
 
-        # ROI ve exposure
         set_roi_basler(cam, cfg.ROI_W, cfg.ROI_H, cfg.ROI_OFFX, cfg.ROI_OFFY)
-        current_exp = set_exposure_basler(cam, 22600.0)
+        current_exp = set_exposure_basler(cam,cfg.EXPOSURE)
 
-        # AcquisitionMode → Continuous
         try:
             if cam.AcquisitionMode.IsWritable():
                 cam.AcquisitionMode.SetValue("Continuous")
@@ -503,8 +867,6 @@ def track_star():
 
         cam.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
         print("Kamera grabbing başladı.")
-
-        cv2.namedWindow("Circle Tracking", cv2.WINDOW_AUTOSIZE)
 
         while cam.IsGrabbing():
             try:
@@ -518,15 +880,13 @@ def track_star():
                 grabResult.Release()
                 continue
 
-            image = grabResult.Array  # H x W veya H x W x C
+            image = grabResult.Array
             grabResult.Release()
 
-            detection_mode = "green"  # varsayılan
+            detection_mode = "green"
 
             if len(image.shape) == 2:
-                # Tek kanal veri: Bayer mi, gerçek mono mu?
                 if is_bayer:
-                    # Bayer → BGR convert
                     if pixel_format == "BayerRG8":
                         color_img = cv2.cvtColor(image, cv2.COLOR_BAYER_RG2BGR)
                     elif pixel_format == "BayerBG8":
@@ -536,29 +896,24 @@ def track_star():
                     elif pixel_format == "BayerGB8":
                         color_img = cv2.cvtColor(image, cv2.COLOR_BAYER_GB2BGR)
                     else:
-                        # Bilinmeyen Bayer: yine de bir şey deneyelim
                         color_img = cv2.cvtColor(image, cv2.COLOR_BAYER_RG2BGR)
                     detection_mode = "green"
                 else:
-                    # Gerçek Mono8 vb.
-                    print("⚠ Görüntü gerçek tek kanal (mono), renk tespiti olmayacak, parlak daireye düşüyorum.")
+                    print("⚠ Gerçek mono, renk tespiti yok; parlak daire moduna düşüyorum.")
                     gray_img = image
                     color_img = cv2.cvtColor(gray_img, cv2.COLOR_GRAY2BGR)
                     detection_mode = "mono"
             else:
-                # Zaten H x W x 3 → BGR varsay
                 color_img = image
                 detection_mode = "green"
 
             h, w = color_img.shape[:2]
             center = (w // 2, h // 2)
 
-            # --- NESNE TESPİTİ: YEŞİL HEDEF ---
             try:
                 if detection_mode == "green":
                     circle_center, radius_star, maxVal = detect_green_circle_center(color_img)
                 else:
-                    # mono parlak daire
                     circle_center, radius_star, maxVal = detect_bright_circle_center_mono(color_img)
             except Exception as e:
                 print(f"Nesne bulunamadı ({detection_mode}):", e)
@@ -567,19 +922,12 @@ def track_star():
                     annotated, center, (0, 255, 0),
                     cv2.MARKER_CROSS, 20, 2
                 )
-                display_img = cv2.resize(
-                    annotated, (cfg.DISPLAY_W, cfg.DISPLAY_H),
-                    interpolation=cv2.INTER_AREA
-                )
-                cv2.imshow("Circle Tracking", display_img)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q') or key == 27:
-                    break
+                gui.update_camera_frame(annotated)
                 continue
 
             cx, cy = circle_center
             dx = cx - center[0]
-            dy = center[1] - cy  # yukarı pozitif
+            dy = center[1] - cy
 
             az_deg, el_deg = pixels_to_angle(dx, dy)
 
@@ -590,10 +938,8 @@ def track_star():
                 f"az={az_deg:7.3f}° el={el_deg:7.3f}°  I={maxVal:.1f}"
             )
 
-            # --- KAMERA GİMBAL KOMUTU (AYNI KALDI) ---
             send_to_gimbal(az_deg, el_deg)
 
-            # --- OVERLAY BAŞLANGIÇ ---
             annotated = color_img.copy()
             cv2.drawMarker(
                 annotated, center, (0, 255, 0),
@@ -602,29 +948,24 @@ def track_star():
             cv2.circle(annotated, (cx, cy), radius_star, (255, 0, 0), 2)
             cv2.circle(annotated, (cx, cy), 3, (0, 0, 255), -1)
 
-            # ================= LAZER TAKİP BLOĞU =================
+            # Lazer takibi
             try:
                 laser_center, radius_laser, laser_I = detect_laser_circle_center(color_img)
                 lx, ly = laser_center
 
-                # Lazer → YILDIZ hizalama: lazer yeşil noktaya kilitlensin
-                dx_laser_px = cx - lx          # hedef: yeşil nokta
-                dy_laser_px = ly - cy          # ekran koordinatına göre
+                dx_laser_px = cx - lx
+                dy_laser_px = ly - cy
 
                 az_laser_deg, el_laser_deg = pixels_to_angle(dx_laser_px, dy_laser_px)
 
-                # Deadband
                 if abs(az_laser_deg) < LASER_DEADBAND_DEG:
                     az_laser_deg = 0.0
                 if abs(el_laser_deg) < LASER_DEADBAND_DEG:
                     el_laser_deg = 0.0
 
-                # BURAYA KENDİ LAZER GİMBAL KOMUTUNU BAĞLA
-                # Örn: send_to_laser_gimbal(az_laser_deg, el_laser_deg)
                 try:
                     move_laser_gimbal_relative(az_laser_deg, el_laser_deg)
                 except NameError:
-                    # Henüz tanımlamadıysan sessizce geç, sadece log yaz
                     pass
 
                 print(
@@ -633,15 +974,11 @@ def track_star():
                     f"az_L={az_laser_deg:7.3f}° el_L={el_laser_deg:7.3f}° I_L={laser_I:.1f}"
                 )
 
-                # Overlay: lazeri de çiz
                 cv2.circle(annotated, (lx, ly), radius_laser, (0, 255, 255), 2)
                 cv2.circle(annotated, (lx, ly), 3, (0, 255, 255), -1)
 
-            except Exception as e:
-                # Lazer görünmüyorsa veya tespit edilemediyse sadece logla, takip döngüsü bozulmasın
-                # print(f"Lazer bulunamadı: {e}")
+            except Exception:
                 pass
-            # =====================================================
 
             if current_exp is None:
                 exp_text = "Exp: N/A"
@@ -664,17 +1001,10 @@ def track_star():
                 0.5, (200, 200, 200), 1
             )
 
-            display_img = cv2.resize(
-                annotated,
-                (cfg.DISPLAY_W, cfg.DISPLAY_H),
-                interpolation=cv2.INTER_AREA
-            )
-            cv2.imshow("Circle Tracking", display_img)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q') or key == 27:
-                break
+            # GUI'ye frame gönder
+            gui.update_camera_frame(annotated)
 
-        cv2.destroyAllWindows()
+        print("Track loop bitti.")
 
     finally:
         try:
@@ -694,23 +1024,37 @@ def track_star():
                 pass
 
 
-def main ():
+# -------------------------------------------------
+#  main
+# -------------------------------------------------
+
+def main():
     global SER_MKS_PORT
     global SER_ARD1_PORT
     global SER_ARD2_PORT
 
+    # Tkinter GUI
+    root = tk.Tk()
+    gui = TelemetryGUI(root)
+
+    # Seri portları tespit et
     mks_port, ard_ports = list_serial_ports()
     SER_MKS_PORT = mks_port
-    SER_ARD1_PORT = ard_ports[0]
-    SER_ARD2_PORT = ard_ports[1]
+    if ard_ports:
+        SER_ARD1_PORT = ard_ports[0]
+    print("MKS port:", SER_MKS_PORT, "Arduino ports:", ard_ports)
 
-    threads = []
+    # Manyetik cetvel / Arduino thread’leri GUI’ye bağla
     for port in ard_ports:
-        t = threading.Thread(target=arduino_worker, args=(port,), daemon=True)
+        t = threading.Thread(target=arduino_worker, args=(port, gui), daemon=True)
         t.start()
-        threads.append(t)
-    track_star()
-    
+
+    # Basler + gimbal tracking thread’i
+    track_thread = threading.Thread(target=track_star, args=(gui,), daemon=True)
+    track_thread.start()
+
+    # GUI main loop
+    root.mainloop()
 
 
 if __name__ == "__main__":
